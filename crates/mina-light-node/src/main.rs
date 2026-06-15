@@ -59,6 +59,14 @@ async fn main() {
                     let outcome = monitor.ingest(&tip);
                     ingested += 1; // a real indexer would persist `tip` here
                     report(height, &outcome);
+                    // Expose the new best verified tip (for a consumer's liveness
+                    // cross-check: compare this p2p-verified tip against a GCS tip).
+                    if matches!(
+                        outcome,
+                        Ingest::Genesis | Ingest::Extend { .. } | Ingest::Reorg { .. }
+                    ) {
+                        expose_tip(height, &tip.state_hash().to_string());
+                    }
                 }
                 Ok(None) => {
                     rejected += 1;
@@ -113,4 +121,20 @@ fn report(height: u32, outcome: &Ingest) {
         Ingest::Unlinked => "? unlinked (ancestor outside window)".into(),
     };
     eprintln!("  ✓ verified h{height} — {line}");
+}
+
+/// Expose the current best **proof-verified** tip so a consumer (e.g. a trustless
+/// indexer) can cross-check it against a less-trusted source (e.g. a GCS tip) —
+/// divergence reveals staleness/withholding. Emits a structured JSON line on stdout
+/// (stderr carries the human logs) and, if `LIGHT_NODE_TIP_FILE` is set, atomically
+/// writes the tip there for file-based IPC.
+fn expose_tip(height: u32, state_hash: &str) {
+    println!(r#"{{"verified_tip":{{"height":{height},"state_hash":"{state_hash}"}}}}"#);
+    if let Ok(path) = std::env::var("LIGHT_NODE_TIP_FILE") {
+        let json = format!("{{\"height\":{height},\"state_hash\":\"{state_hash}\"}}\n");
+        let tmp = format!("{path}.tmp");
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
 }

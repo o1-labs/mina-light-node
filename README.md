@@ -44,9 +44,12 @@ MINA_NETWORK=devnet cargo run -p mina-light-node
 - [x] Wire the **trust gate**: verify each gossiped block's proof before ingest
       (`verify_tip` + `ChainMonitor`); validated on live devnet (h528196).
 - [ ] **Account reads**: Merkle-proof balances/nonce against the verified ledger root.
+      (Verify side exists in `mina-verify::verify_account_inclusion`; needs the account +
+      Merkle path fetched via the libp2p sync-ledger RPC.)
 - [x] **Mempool tap**: tx-pool gossip → bounded, TTL'd view (`mempool::MempoolView`);
       validated on devnet. TODO: canonical tx hash (currently a content-hash dedup id).
 - [ ] **Broadcast**: publish signed txs to the tx-pool gossip topic.
-- [ ] **Liveness cross-check**: expose the live p2p tip for consumers (e.g. the indexer)
-      to compare against a GCS-sourced tip and flag divergence.
+- [x] **Liveness cross-check** (expose side): the node emits its best proof-verified tip
+      as a structured stdout line + optional `LIGHT_NODE_TIP_FILE`; validated on devnet
+      (h528200). Consumers (e.g. the indexer) compare it vs a GCS tip to flag divergence.
 - [ ] HTTP/RPC surface + deploy glue (see `deploy/`).

@@ -21,6 +21,14 @@ pub const DEVNET_PEERS: &[&str] = &[
     "/dns4/seed-1.devnet.gcp.o1test.net/tcp/10003/p2p/12D3KooWAdgYL6hv18M3iDBdaK1dRygPivSfAfBNDzie6YqydVbs",
     "/dns4/seed-2.devnet.gcp.o1test.net/tcp/10003/p2p/12D3KooWLjs54xHzVmMmGYb7W5RVibqbwD1co7M2ZMfPgPm7iAag",
     "/dns4/seed-3.devnet.gcp.o1test.net/tcp/10003/p2p/12D3KooWEiGVAFC7curXWXiGZyMWnZK9h8BKr88U8D5PKV3dXciv",
+    "/ip4/65.108.123.234/tcp/8302/p2p/12D3KooWSfbf7roLyxHVQrCX5XcjAk5f8HeHPNBwsUDCojzcox81",
+    "/ip4/65.109.147.145/tcp/8302/p2p/12D3KooWKuCvno5wq5mKorTgjjiubuCUTRTanbc3eBVejGiUw3st",
+    "/ip4/65.109.29.163/tcp/8302/p2p/12D3KooWSwetAL9qf3vGYHPa8zPV984YurcMA88815DwDdXaBgZt",
+    "/ip4/65.108.37.166/tcp/32107/p2p/12D3KooWBzwA4uRgwbmjX7LAsp9nMacW8xPqJejbmw1W96nXX1Ra",
+    "/ip4/135.181.19.59/tcp/32009/p2p/12D3KooWPtxgAhUNd5MD4q6625tA1BGZ21eSNhXtFkFHscHKLdXV",
+    "/ip4/37.27.118.240/tcp/32010/p2p/12D3KooWSFgucvvf5fwwHD4ziApbtqZGWtbb5B9btmvsjghQt9Jk",
+    "/ip4/103.50.33.192/tcp/8302/p2p/12D3KooWK8CL1rzFQVqTPPU28oRb2aWGfp3gUdLxht1um79Sdssn",
+    "/ip4/135.181.117.217/tcp/8302/p2p/12D3KooWL1kJuFjZT3HpRvUtF5AACgsC76YA7GxiW636cY5o7UBk",
 ];
 
 /// Live mainnet chain id.

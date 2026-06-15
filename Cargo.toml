@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mina-relay",
+    "crates/mina-light-node",
+]
+
+[workspace.dependencies]
+# The Mina light node = mina-relay (this repo) + mina-verify (separate repo).
+# mina-relay is proof-systems-agnostic (libp2p + message types only); the verifier
+# is pulled in by the `mina-light-node` binary when wiring the trust gate.
+mina-relay = { path = "crates/mina-relay" }
+
+# Verifier — pulled in by the light-node binary (TODO: wire the trust gate).
+# mina-verify = { git = "https://github.com/MinaProtocol/mina-verify", branch = "verify/mesa-support" }
+
+# openmina message types + p2p plumbing (proof-systems-agnostic subset).
+mina-p2p-messages = { git = "https://github.com/o1-labs/mina-rust", rev = "ab69eaed" }
+binprot = { git = "https://github.com/openmina/binprot-rs", rev = "400b52c" }
+libp2p = { git = "https://github.com/o1-labs/rust-libp2p", rev = "e88cec09bd2554f4cc79ff90f200e4c864adf495", default-features = false }
+
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+blake2 = "0.10"
+hex = "0.4"
+pin-project-lite = "0.2"
+env_logger = "0.11"
+log = "0.4"
+
+# Required by mina-p2p-messages' dep tree (multihash 0.18 -> yanked core2 0.4.0).
+[patch.crates-io]
+num-bigint = { git = "https://github.com/openmina/num-bigint", branch = "rebase-onstack" }
+num-rational = { git = "https://github.com/openmina/num-rational", branch = "rebase-onstack" }

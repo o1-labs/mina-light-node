@@ -1,0 +1,27 @@
+[package]
+name = "mina-relay"
+version = "0.0.1"
+edition = "2021"
+description = "Mina p2p relay: connect to the gossip network, receive blocks, tap the mempool, and broadcast transactions. Proof-systems-agnostic (no verification)."
+license = "Apache-2.0"
+
+[dependencies]
+libp2p = { workspace = true, features = [
+    "tokio",
+    "noise",
+    "pnet",
+    "tcp",
+    "yamux",
+    "dns",
+    "gossipsub",
+    "macros",
+] }
+tokio = { workspace = true }
+mina-p2p-messages = { workspace = true }
+binprot = { workspace = true }
+void = "1"
+blake2 = { workspace = true }
+hex = { workspace = true }
+pin-project-lite = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }

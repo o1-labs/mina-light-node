@@ -1,0 +1,17 @@
+[package]
+name = "mina-light-node"
+version = "0.0.1"
+edition = "2021"
+description = "The Mina light node: joins the p2p network (mina-relay) and verifies the chain from its recursive proof (mina-verify). A trustless light client that participates in the network."
+license = "Apache-2.0"
+
+[[bin]]
+name = "mina-light-node"
+path = "src/main.rs"
+
+[dependencies]
+mina-relay = { workspace = true }
+# mina-verify = { workspace = true }   # TODO: wire the trust gate (verify tip / trust chain)
+tokio = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }

@@ -1,0 +1,12 @@
+# Mina light node — joins p2p (mina-relay) + verifies (mina-verify).
+# TODO: add the verify sidecar (MinaProtocol/mina-verify mina-verify-server) once
+# the trust gate is wired, or run verification in-process.
+services:
+  mina-light-node:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      MINA_NETWORK: devnet
+      RUST_LOG: info
+    restart: unless-stopped

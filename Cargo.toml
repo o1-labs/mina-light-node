@@ -11,10 +11,14 @@ members = [
 # is pulled in by the `mina-light-node` binary when wiring the trust gate.
 mina-relay = { path = "crates/mina-relay" }
 
-# Verifier — pulled in by the light-node binary (TODO: wire the trust gate).
-# mina-verify = { git = "https://github.com/MinaProtocol/mina-verify", branch = "verify/mesa-support" }
+# Verifier — the trust gate. Pinned to MinaProtocol/mina-verify@main, which uses the
+# same openmina rev (o1-labs/mina-rust@ab69eaed) as mina-relay below, so the
+# mina-p2p-messages subtree unifies. proof-systems (0.3.0) + the num-bigint patches
+# come transitively from mina-verify's workspace.
+mina-verify = { git = "https://github.com/MinaProtocol/mina-verify", rev = "52fe76475349927591162a27f7512f1ce453d225" }
 
-# openmina message types + p2p plumbing (proof-systems-agnostic subset).
+# openmina message types (proof-systems-agnostic subset used by mina-relay) — must
+# match mina-verify's rev so the graph unifies on one mina-p2p-messages.
 mina-p2p-messages = { git = "https://github.com/o1-labs/mina-rust", rev = "ab69eaed" }
 binprot = { git = "https://github.com/openmina/binprot-rs", rev = "400b52c" }
 libp2p = { git = "https://github.com/o1-labs/rust-libp2p", rev = "e88cec09bd2554f4cc79ff90f200e4c864adf495", default-features = false }

@@ -2,6 +2,7 @@
 //! each block (NewState) message to a callback. Used by the `mina-relay`
 //! binary (save to disk) and by `mina-verify-monitor` (verify-before-ingest).
 
+pub mod mempool;
 pub mod rpc;
 pub mod rpc_net;
 mod transport;
@@ -76,15 +77,48 @@ pub fn network_seeds(network: &str) -> Option<(&'static str, &'static [&'static 
 }
 
 /// Connect to a Mina network over gossip and invoke `on_block` with the raw gossip
-/// payload (`[8-byte len][GossipNetMessageV2 binprot]`) of each `NewState` (block).
-///
-/// Runs until `on_block` returns [`ControlFlow::Break`] or `deadline` elapses. The
-/// payload is in the exact form [`mina_verify::block_from_gossip_payload`] expects.
+/// payload of each `NewState` (block). Thin wrapper over [`subscribe_gossip`] that
+/// filters to the block tag (`0`); the payload is in the exact form
+/// [`mina_verify::block_from_gossip_payload`] expects.
 pub async fn subscribe_blocks<F, T>(
     chain_id: &str,
     peers: &[&str],
     deadline: Option<Duration>,
     mut on_block: F,
+    on_tick: T,
+) where
+    F: FnMut(&[u8]) -> ControlFlow<()>,
+    T: FnMut(usize) -> ControlFlow<()>,
+{
+    subscribe_gossip(
+        chain_id,
+        peers,
+        deadline,
+        |data| {
+            // tag at offset 8: 0 = NewState (block).
+            if data.get(8) == Some(&0) {
+                on_block(data)
+            } else {
+                ControlFlow::Continue(())
+            }
+        },
+        on_tick,
+    )
+    .await
+}
+
+/// Connect to a Mina network over gossip and invoke `on_msg` with the raw payload
+/// (`[8-byte len][GossipNetMessageV2 binprot]`) of **every** gossip message — blocks
+/// (tag 0), snark-pool diffs (1), and transaction-pool diffs (2). Discriminate on
+/// `data[8]`; decode with [`mina_p2p_messages::gossip::GossipNetMessageV2`] (e.g.
+/// [`crate::mempool::tx_pool_diff_from_gossip`] for pending transactions).
+///
+/// Runs until `on_msg` returns [`ControlFlow::Break`] or `deadline` elapses.
+pub async fn subscribe_gossip<F, T>(
+    chain_id: &str,
+    peers: &[&str],
+    deadline: Option<Duration>,
+    mut on_msg: F,
     mut on_tick: T,
 ) where
     F: FnMut(&[u8]) -> ControlFlow<()>,
@@ -150,11 +184,10 @@ pub async fn subscribe_blocks<F, T>(
             }
             ev = swarm.next() => match ev {
                 Some(SwarmEvent::Behaviour(gossipsub::Event::Message { message, .. })) => {
-                    // tag at offset 8: 0 = NewState (block).
-                    if message.data.get(8) == Some(&0) {
-                        if let ControlFlow::Break(()) = on_block(&message.data) {
-                            break;
-                        }
+                    // Every gossip message (block / snark-pool / tx-pool diff); the
+                    // caller discriminates on data[8] (0=block, 1=snark, 2=tx-pool).
+                    if let ControlFlow::Break(()) = on_msg(&message.data) {
+                        break;
                     }
                 }
                 Some(SwarmEvent::ConnectionEstablished { peer_id, .. }) => {

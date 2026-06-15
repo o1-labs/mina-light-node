@@ -29,17 +29,19 @@ pub fn tx_pool_diff_from_gossip(payload: &[u8]) -> Vec<MinaBaseUserCommandStable
     }
 }
 
-/// A content-addressed id for a user command (blake2b of its binprot encoding).
-///
-/// NOTE: this is a stable *dedup* key, NOT the canonical Mina transaction hash that a
-/// Rosetta `transaction_identifier` uses. Canonical hashing is a TODO for the adapter.
+/// The canonical Mina transaction hash for a user command (base58check, e.g. `5J...`)
+/// — the same identifier explorers show and a Rosetta `transaction_identifier` uses.
+/// Falls back to a blake2b content hash only if canonical hashing fails.
 pub fn command_id(cmd: &MinaBaseUserCommandStableV2) -> String {
+    if let Ok(h) = cmd.hash() {
+        return h.to_string();
+    }
+    // fallback: blake2b content-hash dedup key
     use blake2::{Blake2b512, Digest};
     let mut bytes = Vec::new();
     cmd.binprot_write(&mut bytes)
         .expect("binprot_write to a Vec is infallible");
-    let digest = Blake2b512::digest(&bytes);
-    hex::encode(&digest[..16]) // 32-hex short id
+    hex::encode(&Blake2b512::digest(&bytes)[..16])
 }
 
 /// A pending transaction observed on gossip.

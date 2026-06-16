@@ -55,13 +55,13 @@ pub const MAINNET_PEERS: &[&str] = &[
 pub const MESA_MUT_CHAIN_ID: &str =
     "8b8ccbf273ef48aa0193ed634e69540657f0fc4292c9919a54b76a21b104abb2";
 
-/// mesa-mut peers (live snapshot; no stable published seeds for this network).
+/// mesa-mut seed peers — the stable published seeds (DNS, won't rotate like IPs).
+/// Source: the mesa upgrade tracker's `artifacts.static.peerList`, i.e.
+/// `https://storage.googleapis.com/o1labs-gitops-infrastructure/mina-mesa-mut/mina-mesa-mut-peer-list-url.txt`.
+/// Override at runtime with a fetched list via `LIGHT_NODE_PEERS_URL` (see the server).
 pub const MESA_MUT_PEERS: &[&str] = &[
-    "/ip4/57.129.147.16/tcp/8302/p2p/12D3KooWAhy6QE9Re1dJwQiU6QMooVA9hTPN2HxJsnSjBQALANFv",
-    "/ip4/194.87.21.152/tcp/8302/p2p/12D3KooWKPYJknMVauxpvWpwt4E1SUXr9fsjAN8YaYHaCv1FTFjg",
-    "/ip4/37.27.109.20/tcp/8302/p2p/12D3KooWBZrHAfHDvtWUqW2ngSsQfHtyHqzQzxyQEvsjZygdCV9N",
-    "/ip4/65.21.197.119/tcp/8302/p2p/12D3KooWF2sNkn1urFsQvB9GMSQCpkMMzuYvhqcWknWK6fUdYWE7",
-    "/ip4/65.109.53.139/tcp/8302/p2p/12D3KooWGUjdTjajTMMzz8tJfCWTLcayDaixzWYEHLaB8gQwZrsy",
+    "/dns4/seed-1.mesa-mut.minaprotocol.com/tcp/10005/p2p/12D3KooWBHj5u5BiC7873kA8u9Web2e8KDPyYXMKFU3TgXYd6oNA",
+    "/dns4/seed-2.mesa-mut.minaprotocol.com/tcp/10006/p2p/12D3KooWRFqPD4GiTi3RAifE2Dz9tvuDQmYunTSdw6hWEfqT6R7Y",
 ];
 
 /// The consensus-messages gossip topic (blocks + pool diffs).

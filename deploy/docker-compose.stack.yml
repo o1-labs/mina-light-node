@@ -1,0 +1,95 @@
+# Full trustless Mina stack on mesa-mut — light node + indexer + verifier (+ adapter).
+#
+#   cd deploy && docker compose -f docker-compose.stack.yml up -d --build
+#
+# Joins the existing `trustless` docker network so it integrates with an already-running
+# mina-indexer / mina-verifier (started by the indexer session). The indexer service here
+# REUSES the existing data bind-mount (db + blocks) — so it continues from where it is,
+# no re-bootstrap from genesis. If the indexer/verifier are already running outside
+# compose, leave their services commented and only the light-node (+ adapter) come up on
+# the shared network.
+#
+# Services / ports (internal to the `trustless` network unless published):
+#   light-node   :8645  this repo — trustless p2p verify + proof-anchored reads/submit
+#   indexer      :8080  Granola mina-indexer — mesa block/ledger data (GraphQL)
+#   verifier     :8090  mina-verify-server — ab84160 block-proof sidecar
+#   minamesh     :3000  Rosetta/Mesh adapter (optional)
+
+networks:
+  trustless:
+    external: true            # the network the indexer/verifier already run on
+    name: trustless
+
+services:
+  light-node:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: mina-light-node:mesa
+    environment:
+      MINA_NETWORK: mesa-mut
+      MINA_VK_JSON: /vk/mesa_vk.json
+      # Tip source = the indexer's precomputed blocks (reuse its data, no p2p bootstrap).
+      # The light node verifies each block's proof before adopting it — still trustless.
+      LIGHT_NODE_BLOCKS_DIR: /indexer-blocks
+      LIGHT_NODE_HTTP_ADDR: 0.0.0.0:8645
+      RUST_LOG: mina_light_node=info,mina_relay=warn
+    volumes:
+      - ./mesa_vk.json:/vk/mesa_vk.json:ro
+      # Reuse the indexer's already-downloaded blocks (read-only).
+      - ${INDEXER_DATA:-/home/darek/work/o1labs/mina-indexer/data}/blocks:/indexer-blocks:ro
+    networks: [trustless]
+    ports:
+      - "8645:8645"
+    restart: unless-stopped
+
+  # Granola mina-indexer — reuses the existing data dir (no re-ingest). Leave commented if
+  # it is already running outside compose on the `trustless` network.
+  # indexer:
+  #   image: mina-indexer:mesa-prod
+  #   command:
+  #     - mina-indexer
+  #     - --socket=/data/mi.sock
+  #     - server
+  #     - start
+  #     - --network=mesa
+  #     - --genesis-hash=3NKQttwm8QRdvSZL62Lid8YAPCXBuAucZPDT8mJriHmw2qk9cVcr
+  #     - --genesis-ledger=/data/mesa-genesis.json
+  #     - --database-dir=/data/db
+  #     - --blocks-dir=/data/blocks
+  #     - --fetch-new-blocks-exe=/bin/mesa-pull
+  #     - --fetch-new-blocks-delay=60
+  #     - --missing-block-recovery-exe=/bin/mesa-pull
+  #     - --missing-block-recovery-delay=120
+  #     - --verify-block-exe=/bin/verify-block
+  #   volumes:
+  #     - ${INDEXER_DATA:-/home/darek/work/o1labs/mina-indexer/data}:/data   # REUSE — no re-bootstrap
+  #   networks: [trustless]
+  #   expose: ["8080"]
+  #   restart: unless-stopped
+
+  # ab84160 block-proof verify sidecar (used by the indexer's verify-block step).
+  # verifier:
+  #   image: mina-verify:mesa-ab84160
+  #   environment:
+  #     MINA_VK_JSON: /vk/mesa_vk.json
+  #     BIND: 0.0.0.0:8090
+  #   volumes:
+  #     - ./mesa_vk.json:/vk/mesa_vk.json:ro
+  #   networks: [trustless]
+  #   expose: ["8090"]
+  #   restart: unless-stopped
+
+  # Rosetta/Mesh adapter (optional). Routes mempool/balance/submit through the light node;
+  # /block + historical reads come from its archive/indexer backend.
+  # minamesh:
+  #   image: minamesh:trustless
+  #   environment:
+  #     MINAMESH_LIGHT_NODE_URL: http://light-node:8645
+  #     MINAMESH_PROXY_URL: https://plain-1-graphql.mesa-mut.minaprotocol.com/graphql
+  #     MINAMESH_ARCHIVE_DATABASE_URL: ${MINAMESH_ARCHIVE_DATABASE_URL}
+  #   command: ["mina-mesh", "serve", "--playground"]
+  #   networks: [trustless]
+  #   ports: ["3000:3000"]
+  #   depends_on: [light-node]
+  #   restart: unless-stopped

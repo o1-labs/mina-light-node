@@ -70,4 +70,8 @@ MINA_NETWORK=devnet cargo run -p mina-light-node
       needed (`?index=` also accepted). Validated on devnet: by-pubkey and by-index reads
       agree (h528327; 81,611-account map swept in ~2.5 min). `MINA_NETWORK`,
       `LIGHT_NODE_HTTP_ADDR` (default :8645).
-- [ ] Deploy glue (see `deploy/`).
+- [x] **Deploy glue** (`deploy/`): `Dockerfile` builds `mina-light-node-server`;
+      `docker-compose.yml` runs the trustless light node (+ optional MinaMesh adapter).
+      The **mesa-mut** profile (branch `feat/mesa-mut`: ab84160 verifier on the dkijania
+      fork) mounts the fork-pinned VK and verified live mesa-mut block h302075 in a
+      container. `cd deploy && docker compose up --build`.

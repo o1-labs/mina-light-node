@@ -2,6 +2,7 @@
 //! each block (NewState) message to a callback. Used by the `mina-relay`
 //! binary (save to disk) and by `mina-verify-monitor` (verify-before-ingest).
 
+pub mod broadcast;
 pub mod mempool;
 pub mod rpc;
 pub mod rpc_net;

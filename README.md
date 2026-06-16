@@ -53,7 +53,11 @@ MINA_NETWORK=devnet cargo run -p mina-light-node
 - [x] **Mempool tap**: tx-pool gossip → bounded, TTL'd view (`mempool::MempoolView`),
       keyed by the canonical Mina tx hash (`MinaBaseUserCommandStableV2::hash()`, the
       Rosetta `transaction_identifier`); validated on devnet.
-- [ ] **Broadcast**: publish signed txs to the tx-pool gossip topic.
+- [x] **Broadcast**: publish signed txs to the tx-pool gossip topic
+      (`broadcast::broadcast_tx` / `encode_tx_pool_diff`; inverse of the mempool tap).
+      Validated on devnet (`cargo run -p mina-relay --example broadcast_tx`): captures a
+      real signed tx, round-trips the encoder through the decoder, and publishes to the
+      gossip mesh. Backs Rosetta `/construction/submit`.
 - [x] **Liveness cross-check** (expose side): the node emits its best proof-verified tip
       as a structured stdout line + optional `LIGHT_NODE_TIP_FILE`; validated on devnet
       (h528200). Consumers (e.g. the indexer) compare it vs a GCS tip to flag divergence.

@@ -2853,6 +2853,7 @@ version = "0.0.1"
 dependencies = [
  "env_logger",
  "log",
+ "mina-p2p-messages",
  "mina-relay",
  "mina-verify",
  "tokio",
@@ -3016,7 +3017,7 @@ dependencies = [
 [[package]]
 name = "mina-verify"
 version = "0.0.1"
-source = "git+https://github.com/MinaProtocol/mina-verify?rev=52fe76475349927591162a27f7512f1ce453d225#52fe76475349927591162a27f7512f1ce453d225"
+source = "git+https://github.com/MinaProtocol/mina-verify?rev=eaf4fced315c5d4068dd6ab6246a230f59687b04#eaf4fced315c5d4068dd6ab6246a230f59687b04"
 dependencies = [
  "base64 0.22.1",
  "binprot",

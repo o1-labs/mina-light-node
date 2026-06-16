@@ -15,3 +15,7 @@ mina-verify = { workspace = true }
 tokio = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
+
+[dev-dependencies]
+# Examples that issue raw sync-ledger queries need the message types directly.
+mina-p2p-messages = { workspace = true }

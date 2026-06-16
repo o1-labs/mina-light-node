@@ -43,9 +43,13 @@ MINA_NETWORK=devnet cargo run -p mina-light-node
 
 - [x] Wire the **trust gate**: verify each gossiped block's proof before ingest
       (`verify_tip` + `ChainMonitor`); validated on live devnet (h528196).
-- [ ] **Account reads**: Merkle-proof balances/nonce against the verified ledger root.
-      (Verify side exists in `mina-verify::verify_account_inclusion`; needs the account +
-      Merkle path fetched via the libp2p sync-ledger RPC.)
+- [x] **Account reads**: Merkle-proof balances/nonce against a verified ledger root.
+      The relay walks the libp2p sync-ledger RPC (`fetch_sync_ledger_answers`, a dumb
+      pipe); `mina-verify` builds the query plan + folds the account/path onto a proven
+      root (`sync_ledger_queries` / `verify_account_at_root`). Validated on devnet
+      (`cargo run --example account_read`): h528297's proof anchors account index 0's
+      balance. NB peers serve only the **epoch** ledgers, not the staged tip root, so
+      reads are against the proof-anchored epoch ledger (finalized balances).
 - [x] **Mempool tap**: tx-pool gossip → bounded, TTL'd view (`mempool::MempoolView`),
       keyed by the canonical Mina tx hash (`MinaBaseUserCommandStableV2::hash()`, the
       Rosetta `transaction_identifier`); validated on devnet.

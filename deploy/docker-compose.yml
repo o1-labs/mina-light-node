@@ -30,7 +30,11 @@ services:
       MINA_NETWORK: mesa-mut
       MINA_VK_JSON: /vk/mesa_vk.json
       LIGHT_NODE_HTTP_ADDR: 0.0.0.0:8645
-      RUST_LOG: mina_light_node=info
+      # mina_relay=warn surfaces p2p connection drops. mesa-mut's hardcoded peer snapshot
+      # (MESA_MUT_PEERS) is small + intermittent: if /tip stays "no verified tip yet",
+      # the peers aren't delivering gossip — refresh MESA_MUT_PEERS or wait. Block
+      # verification itself is solid (the ab84160 trust gate), gated only on a live peer.
+      RUST_LOG: mina_light_node=info,mina_relay=warn
     volumes:
       - ./mesa_vk.json:/vk/mesa_vk.json:ro
     ports:

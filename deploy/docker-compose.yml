@@ -1,12 +1,53 @@
-# Mina light node — joins p2p (mina-relay) + verifies (mina-verify).
-# TODO: add the verify sidecar (MinaProtocol/mina-verify mina-verify-server) once
-# the trust gate is wired, or run verification in-process.
+# Trustless Mina light stack — mesa-mut.
+#
+#   cd deploy && docker compose up --build
+#
+# Services:
+#   light-node  the trustless light node. Joins mesa-mut p2p (mina-relay), verifies every
+#               block's recursive SNARK proof (ab84160) against the mounted mesa VK, and
+#               serves proof-anchored reads + submit + mempool over HTTP. Holds no keys,
+#               trusts no peer. Self-contained — this is the core deliverable.
+#   minamesh    (optional) the Rosetta/Mesh REST adapter, routing live-state endpoints
+#               (mempool, frontier balance, submit) through the light node. It ALSO needs
+#               a Mina GraphQL proxy + Postgres archive for /block + historical reads —
+#               supply MINAMESH_PROXY_URL + MINAMESH_ARCHIVE_DATABASE_URL. Build its image
+#               from o1-labs/MinaMesh@feat/trustless-light-backend.
+#
+# The light-node image is built from THIS branch (feat/mesa-mut): dkijania/mina-rust
+# @49cc4ea3 + proof-systems ab84160 — required to verify mesa-mut proofs. For devnet/
+# mainnet, build from a 0.3.0 branch instead and drop MINA_VK_JSON (embedded VK).
+#
+# The mesa verification key (deploy/mesa_vk.json) is fork-pinned (length 297734). mesa-mut
+# is PREFLIGHT and may re-fork — regenerate the VK from the deployed daemon config if
+# verification starts failing.
+
 services:
-  mina-light-node:
+  light-node:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
     environment:
-      MINA_NETWORK: devnet
-      RUST_LOG: info
+      MINA_NETWORK: mesa-mut
+      MINA_VK_JSON: /vk/mesa_vk.json
+      LIGHT_NODE_HTTP_ADDR: 0.0.0.0:8645
+      RUST_LOG: mina_light_node=info
+    volumes:
+      - ./mesa_vk.json:/vk/mesa_vk.json:ro
+    ports:
+      - "8645:8645"
     restart: unless-stopped
+
+  # Optional Rosetta adapter. Uncomment after building the MinaMesh image and providing a
+  # mesa-mut GraphQL proxy + Postgres archive.
+  # minamesh:
+  #   image: minamesh:trustless        # docker build -t minamesh:trustless <MinaMesh repo>
+  #   environment:
+  #     MINAMESH_LIGHT_NODE_URL: http://light-node:8645   # trustless live-state backend
+  #     MINAMESH_PROXY_URL: https://plain-1-graphql.mesa-mut.minaprotocol.com/graphql
+  #     MINAMESH_ARCHIVE_DATABASE_URL: ${MINAMESH_ARCHIVE_DATABASE_URL}  # operator-supplied PG
+  #     RUST_LOG: info
+  #   command: ["mina-mesh", "serve", "--playground"]
+  #   depends_on: [light-node]
+  #   ports:
+  #     - "3000:3000"
+  #   restart: unless-stopped

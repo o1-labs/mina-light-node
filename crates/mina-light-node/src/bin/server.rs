@@ -18,6 +18,7 @@
 //! Env: MINA_NETWORK (devnet|mainnet), LIGHT_NODE_HTTP_ADDR (default 127.0.0.1:8645),
 //!      MINA_VK_JSON (optional, for networks without an embedded VK).
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::sync::{mpsc, Arc, Mutex, RwLock};
@@ -28,13 +29,16 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use mina_p2p_messages::binprot::BinProtRead;
-use mina_p2p_messages::v2::MinaBaseUserCommandStableV2;
+use mina_p2p_messages::v2::{
+    LedgerHash, MinaBaseUserCommandStableV2, MinaLedgerSyncLedgerAnswerStableV2,
+    MinaLedgerSyncLedgerQueryStableV1,
+};
 use mina_relay::broadcast::broadcast_tx;
 use mina_relay::mempool::MempoolView;
 use mina_relay::{network_seeds, rpc_net, subscribe_gossip};
 use mina_verify::{
-    block_from_gossip_payload, staking_epoch_ledger_hash, sync_ledger_queries,
-    verify_account_at_root, Block, Verifier, LEDGER_DEPTH,
+    block_from_gossip_payload, ledger_sweep_queries, pubkey_index_pairs, staking_epoch_ledger_hash,
+    sync_ledger_queries, verify_account_at_root, Block, Verifier, LEDGER_DEPTH,
 };
 use serde::{Deserialize, Serialize};
 
@@ -46,12 +50,22 @@ struct TipInfo {
     state_hash: String,
 }
 
+/// A public-key → leaf-index map. Mina indices are permanent + append-only, so this is
+/// monotonic across ledgers: built once, then only the appended tail is re-swept.
+/// `covered` is the number of leaves already mapped. The map is an untrusted hint —
+/// `/account` re-proves every read against the verified root.
+struct IndexCache {
+    covered: u64,
+    map: HashMap<String, u64>,
+}
+
 struct AppState {
     network: String,
     chain_id: &'static str,
     peers: &'static [&'static str],
     tip: RwLock<Option<TipInfo>>,
     mempool: Mutex<MempoolView>,
+    index: RwLock<Option<IndexCache>>,
 }
 
 #[tokio::main]
@@ -71,6 +85,7 @@ async fn main() {
         peers,
         tip: RwLock::new(None),
         mempool: Mutex::new(MempoolView::new(4096, Duration::from_secs(600))),
+        index: RwLock::new(None),
     });
 
     // Verify-before-tip worker thread (multi-second crypto, off the async runtime).
@@ -140,6 +155,40 @@ async fn main() {
         });
     }
 
+    // Index sweep task: build the pubkey→leaf-index map at cold start, then only sweep
+    // the newly-appended tail (indices are append-only), so `/account?pubkey=` resolves
+    // the index itself — no indexer needed.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                let tip = state.tip.read().unwrap().clone();
+                if let Some(tip) = tip {
+                    let root = staking_epoch_ledger_hash(&tip.block);
+                    let covered = state.index.read().unwrap().as_ref().map(|c| c.covered).unwrap_or(0);
+                    match sweep_tail(state.chain_id, state.peers, root, covered).await {
+                        Ok((num, pairs)) if num > covered => {
+                            let mut guard = state.index.write().unwrap();
+                            let cache = guard
+                                .get_or_insert_with(|| IndexCache { covered: 0, map: HashMap::new() });
+                            for (pk, idx) in pairs {
+                                cache.map.insert(pk, idx);
+                            }
+                            cache.covered = num;
+                            log::info!(
+                                "pubkey→index map: +{} account(s) (now {num} covered)",
+                                num - covered
+                            );
+                        }
+                        Ok(_) => {} // already up to date
+                        Err(e) => log::warn!("epoch-ledger sweep failed: {e}"),
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+    }
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/tip", get(tip))
@@ -151,6 +200,46 @@ async fn main() {
     eprintln!("mina-light-node-server on http://{addr} ({network}) — trustless reads + submit");
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
     axum::serve(listener, app).await.expect("serve");
+}
+
+/// Sweep the leaves at indices `[covered, num)` of the epoch ledger and return
+/// `(num, (pubkey, index) pairs)`. `NumAccounts` sizes it; then one `What_contents` batch
+/// per 32-account subtree of the tail (the whole ledger when `covered == 0`). The map is
+/// an untrusted hint — every `/account` read re-proves inclusion against the verified root.
+async fn sweep_tail(
+    chain_id: &'static str,
+    peers: &'static [&'static str],
+    root: LedgerHash,
+    covered: u64,
+) -> Result<(u64, Vec<(String, u64)>), String> {
+    let na = rpc_net::fetch_sync_ledger_answers(
+        chain_id,
+        peers,
+        root.clone(),
+        &[MinaLedgerSyncLedgerQueryStableV1::NumAccounts],
+        Duration::from_secs(60),
+    )
+    .await?;
+    let num = match na.into_iter().next() {
+        Some(MinaLedgerSyncLedgerAnswerStableV2::NumAccounts(n, _)) => n.0,
+        other => return Err(format!("expected NumAccounts, got {other:?}")),
+    };
+    if num <= covered {
+        return Ok((num, Vec::new()));
+    }
+
+    let queries = ledger_sweep_queries(covered, num, LEDGER_DEPTH);
+    let answers = rpc_net::fetch_sync_ledger_answers(
+        chain_id,
+        peers,
+        root,
+        &queries,
+        Duration::from_secs(300),
+    )
+    .await?;
+    let pairs = pubkey_index_pairs(&answers, mina_verify::sweep_base_index(covered), LEDGER_DEPTH)
+        .map_err(|e| e.to_string())?;
+    Ok((num, pairs))
 }
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
@@ -184,10 +273,12 @@ async fn tip(State(state): State<Arc<AppState>>) -> Result<Json<TipResponse>, Ap
 
 #[derive(Deserialize)]
 struct AccountQuery {
-    /// Leaf index in the epoch ledger — an untrusted hint (from the indexer). A wrong
-    /// hint cannot forge a balance: the path won't fold, or the pubkey won't match.
-    index: u64,
-    /// Optional: cross-check the proved account's public key against this address.
+    /// Leaf index in the epoch ledger — an untrusted hint. A wrong hint cannot forge a
+    /// balance: the path won't fold, or the pubkey won't match. Optional when `pubkey`
+    /// is given (resolved from the swept pubkey→index map).
+    index: Option<u64>,
+    /// Public key to read. Resolves the index from the swept map (if `index` absent) and
+    /// is cross-checked against the proved account either way.
     pubkey: Option<String>,
 }
 
@@ -215,8 +306,29 @@ async fn account(
         .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "no verified tip yet"))?;
     let root = staking_epoch_ledger_hash(&tip.block);
 
+    // Resolve the leaf index: an explicit hint, else from the swept pubkey→index map
+    // (monotonic across epochs, so no epoch-root check is needed).
+    let index = match (q.index, &q.pubkey) {
+        (Some(i), _) => i,
+        (None, Some(pk)) => {
+            let cache = state.index.read().unwrap();
+            match cache.as_ref() {
+                Some(c) => *c.map.get(pk).ok_or_else(|| {
+                    err(StatusCode::NOT_FOUND, format!("{pk} not in the epoch ledger"))
+                })?,
+                None => {
+                    return Err(err(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "pubkey→index map not ready (sweeping epoch ledger)",
+                    ))
+                }
+            }
+        }
+        (None, None) => return Err(err(StatusCode::BAD_REQUEST, "provide ?pubkey= or ?index=")),
+    };
+
     // UNTRUSTED fetch: walk the sync-ledger for the account + Merkle path.
-    let queries = sync_ledger_queries(q.index, LEDGER_DEPTH);
+    let queries = sync_ledger_queries(index, LEDGER_DEPTH);
     let answers = rpc_net::fetch_sync_ledger_answers(
         state.chain_id,
         state.peers,
@@ -228,7 +340,7 @@ async fn account(
     .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("sync-ledger fetch failed: {e}")))?;
 
     // TRUST GATE: fold account + path onto the proven epoch-ledger root.
-    let acct = verify_account_at_root(&root, q.index, LEDGER_DEPTH, &answers)
+    let acct = verify_account_at_root(&root, index, LEDGER_DEPTH, &answers)
         .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("account did not verify: {e}")))?;
 
     let public_key = acct.public_key.into_address();
@@ -236,7 +348,7 @@ async fn account(
         if &public_key != want {
             return Err(err(
                 StatusCode::NOT_FOUND,
-                format!("index {} holds {public_key}, not requested {want}", q.index),
+                format!("index {index} holds {public_key}, not requested {want}"),
             ));
         }
     }

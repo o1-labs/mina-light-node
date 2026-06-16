@@ -16,7 +16,7 @@ mina-relay = { path = "crates/mina-relay" }
 # (o1-labs/mina-rust@ab69eaed) as mina-relay below, so the mina-p2p-messages subtree
 # unifies. proof-systems (0.3.0) + the num-bigint patches come transitively from
 # mina-verify's workspace.
-mina-verify = { git = "https://github.com/MinaProtocol/mina-verify", rev = "eaf4fced315c5d4068dd6ab6246a230f59687b04" }
+mina-verify = { git = "https://github.com/MinaProtocol/mina-verify", rev = "c9967c408b978770268c5e9878eed25b2c6ffc18" }
 
 # openmina message types (proof-systems-agnostic subset used by mina-relay) — must
 # match mina-verify's rev so the graph unifies on one mina-p2p-messages.

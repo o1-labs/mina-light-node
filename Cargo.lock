@@ -3083,7 +3083,7 @@ dependencies = [
 [[package]]
 name = "mina-verify"
 version = "0.0.1"
-source = "git+https://github.com/MinaProtocol/mina-verify?rev=eaf4fced315c5d4068dd6ab6246a230f59687b04#eaf4fced315c5d4068dd6ab6246a230f59687b04"
+source = "git+https://github.com/MinaProtocol/mina-verify?rev=c9967c408b978770268c5e9878eed25b2c6ffc18#c9967c408b978770268c5e9878eed25b2c6ffc18"
 dependencies = [
  "base64 0.22.1",
  "binprot",

@@ -63,8 +63,11 @@ MINA_NETWORK=devnet cargo run -p mina-light-node
       (h528200). Consumers (e.g. the indexer) compare it vs a GCS tip to flag divergence.
 - [x] **HTTP/RPC surface** (`mina-light-node-server` bin): the trustless read/submit/
       mempool API a Rosetta adapter (MinaMesh) consumes. A background task verifies tips
-      + taps the mempool; handlers serve `GET /tip`, `GET /account?pubkey=&index=`
-      (Merkle-proved balance/nonce, index hint from the indexer), `GET /mempool`,
-      `POST /submit` (broadcast). Validated on devnet (h528305): trustless balance read +
-      mempool + tip over HTTP. `MINA_NETWORK`, `LIGHT_NODE_HTTP_ADDR` (default :8645).
+      + taps the mempool; handlers serve `GET /tip`, `GET /account?pubkey=`
+      (Merkle-proved balance/nonce), `GET /mempool`, `POST /submit` (broadcast). A second
+      task sweeps the epoch ledger once per epoch (`What_contents`, 32/batch) into a
+      pubkey→index map, so `/account?pubkey=` resolves the index itself — no indexer
+      needed (`?index=` also accepted). Validated on devnet: by-pubkey and by-index reads
+      agree (h528327; 81,611-account map swept in ~2.5 min). `MINA_NETWORK`,
+      `LIGHT_NODE_HTTP_ADDR` (default :8645).
 - [ ] Deploy glue (see `deploy/`).

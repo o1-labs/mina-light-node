@@ -61,4 +61,10 @@ MINA_NETWORK=devnet cargo run -p mina-light-node
 - [x] **Liveness cross-check** (expose side): the node emits its best proof-verified tip
       as a structured stdout line + optional `LIGHT_NODE_TIP_FILE`; validated on devnet
       (h528200). Consumers (e.g. the indexer) compare it vs a GCS tip to flag divergence.
-- [ ] HTTP/RPC surface + deploy glue (see `deploy/`).
+- [x] **HTTP/RPC surface** (`mina-light-node-server` bin): the trustless read/submit/
+      mempool API a Rosetta adapter (MinaMesh) consumes. A background task verifies tips
+      + taps the mempool; handlers serve `GET /tip`, `GET /account?pubkey=&index=`
+      (Merkle-proved balance/nonce, index hint from the indexer), `GET /mempool`,
+      `POST /submit` (broadcast). Validated on devnet (h528305): trustless balance read +
+      mempool + tip over HTTP. `MINA_NETWORK`, `LIGHT_NODE_HTTP_ADDR` (default :8645).
+- [ ] Deploy glue (see `deploy/`).

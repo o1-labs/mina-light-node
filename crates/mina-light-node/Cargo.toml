@@ -12,9 +12,18 @@ path = "src/main.rs"
 [dependencies]
 mina-relay = { workspace = true }
 mina-verify = { workspace = true }
+mina-p2p-messages = { workspace = true }
 tokio = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+
+[[bin]]
+name = "mina-light-node-server"
+path = "src/bin/server.rs"
 
 [dev-dependencies]
 # Examples that issue raw sync-ledger queries need the message types directly.

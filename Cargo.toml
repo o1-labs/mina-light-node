@@ -24,12 +24,18 @@ mina-p2p-messages = { git = "https://github.com/o1-labs/mina-rust", rev = "ab69e
 binprot = { git = "https://github.com/openmina/binprot-rs", rev = "400b52c" }
 libp2p = { git = "https://github.com/o1-labs/rust-libp2p", rev = "e88cec09bd2554f4cc79ff90f200e4c864adf495", default-features = false }
 
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 blake2 = "0.10"
 hex = "0.4"
 pin-project-lite = "0.2"
 env_logger = "0.11"
 log = "0.4"
+
+# HTTP surface (light-node server): the trustless read/submit/mempool API a Rosetta
+# adapter (MinaMesh) consumes. hyper 1.x + tower are already in the graph.
+axum = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Required by mina-p2p-messages' dep tree (multihash 0.18 -> yanked core2 0.4.0).
 [patch.crates-io]

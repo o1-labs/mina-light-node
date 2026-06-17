@@ -163,9 +163,8 @@ pub async fn fetch_best_tip(
     let run = async {
         // Drive the swarm until a peer opens the RPC stream.
         let stream = loop {
-            match swarm.next().await {
-                Some(SwarmEvent::Behaviour(stream)) => break stream,
-                _ => {}
+            if let Some(SwarmEvent::Behaviour(stream)) = swarm.next().await {
+                break stream;
             }
         };
         // Run the RPC while keeping the swarm polled (drives the muxer).

@@ -12,7 +12,8 @@
 //! Verification (multi-second crypto) runs on a worker thread so it never blocks the
 //! gossip event loop — otherwise we'd miss heartbeats and get pruned from the mesh.
 //!
-//! Env: `MINA_NETWORK` (devnet|mainnet), `LIGHT_NODE_SECS` (run duration, default 600).
+//! Env: `MINA_NETWORK` (devnet|mainnet). `LIGHT_NODE_SECS` optionally bounds the run
+//! (in seconds) for tests/CI; unset = run forever, the out-of-the-box default.
 //! Set `RUST_LOG=info` for libp2p logs.
 
 use std::ops::ControlFlow;
@@ -26,15 +27,19 @@ use mina_verify::{block_from_gossip_payload, ChainMonitor, Ingest, Verifier};
 async fn main() {
     env_logger::init();
 
-    let secs: u64 = std::env::var("LIGHT_NODE_SECS")
+    // Unset = run forever (a real node). A timeout is only for bounded test/CI runs.
+    let deadline = std::env::var("LIGHT_NODE_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(600);
+        .map(Duration::from_secs);
     let network = std::env::var("MINA_NETWORK").unwrap_or_else(|_| "devnet".into());
     let (chain_id, peers) = network_seeds(&network)
         .unwrap_or_else(|| panic!("unknown MINA_NETWORK {network:?} (devnet|mainnet)"));
 
-    eprintln!("mina-light-node on {network} for {secs}s — verifying every block before ingest\n");
+    eprintln!(
+        "mina-light-node on {network} ({}) — verifying every block before ingest\n",
+        deadline.map_or("forever".into(), |d| format!("{}s", d.as_secs())),
+    );
 
     // Worker thread: verify-before-ingest, off the gossip event loop.
     let net = network.clone();
@@ -85,7 +90,7 @@ async fn main() {
     subscribe_blocks(
         chain_id,
         peers,
-        Some(Duration::from_secs(secs)),
+        deadline,
         |payload| {
             // Hand off instantly; verification happens on the worker thread.
             let _ = tx.send(payload.to_vec());

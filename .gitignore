@@ -2,3 +2,6 @@
 **/*.rs.bk
 .DS_Store
 /captured
+
+# Generated index maps (the tracked placeholder deploy/index_map.bin is the exception)
+/*_index_map.bin

@@ -2914,6 +2914,7 @@ name = "mina-light-node"
 version = "0.0.1"
 dependencies = [
  "axum",
+ "blake2",
  "env_logger",
  "hex",
  "log",

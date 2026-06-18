@@ -1,8 +1,8 @@
 name: Release
 
-# On a v* tag: build one image per network (the network is baked at build time via
-# --build-arg) and push to GHCR, then publish a GitHub Release. Also runnable manually
-# (workflow_dispatch) with an explicit version for a dry-run / re-push.
+# On a v* tag: build the baked pubkey→index map per network, build one image per network
+# (network + map baked in), push to GHCR, and publish a GitHub Release with the maps
+# attached. Also runnable manually (workflow_dispatch) with an explicit version.
 on:
   push:
     tags: ["v*"]
@@ -18,10 +18,38 @@ permissions:
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}   # ghcr.io/o1-labs/mina-light-node
+  SYSTEM_DEPS: build-essential pkg-config libssl-dev
 
 jobs:
+  # Build the baked pubkey→index map by sweeping each network's staking-epoch ledger.
+  # continue-on-error: a flaky sweep must not block the image (it falls back to the
+  # in-tree empty placeholder → the server just sweeps at runtime).
+  index-map:
+    name: index map (${{ matrix.network }})
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        network: [devnet, mainnet]
+    steps:
+      - uses: actions/checkout@v4
+      - name: System deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $SYSTEM_DEPS
+      - uses: Swatinem/rust-cache@v2
+      - name: Build mapgen
+        run: cargo build --release --locked -p mina-light-node --bin mina-light-node-mapgen
+      - name: Generate ${{ matrix.network }} index map
+        run: MINA_NETWORK=${{ matrix.network }} ./target/release/mina-light-node-mapgen ${{ matrix.network }}_index_map.bin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: index-map-${{ matrix.network }}
+          path: ${{ matrix.network }}_index_map.bin
+
   images:
     name: image (${{ matrix.network }})
+    needs: index-map
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -38,7 +66,21 @@ jobs:
             v="${GITHUB_REF_NAME#v}"   # v0.0.1 -> 0.0.1
           fi
           echo "v=$v" >> "$GITHUB_OUTPUT"
-          echo "building $IMAGE:${v}-${{ matrix.network }}"
+      # Bake the network's map into the build context (replacing the empty placeholder).
+      # If the map job failed/was skipped, the placeholder stays → runtime sweep.
+      - name: Fetch baked index map
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: index-map-${{ matrix.network }}
+      - name: Stage map into build context
+        run: |
+          if [ -s "${{ matrix.network }}_index_map.bin" ]; then
+            cp "${{ matrix.network }}_index_map.bin" deploy/index_map.bin
+            echo "baked $(wc -c < deploy/index_map.bin) byte map into the ${{ matrix.network }} image"
+          else
+            echo "no map artifact — image ships the empty placeholder (runtime sweep)"
+          fi
       - uses: docker/setup-buildx-action@v3
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -64,8 +106,8 @@ jobs:
 
   release:
     name: github release
-    needs: images
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [images, index-map]
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -74,19 +116,31 @@ jobs:
       - name: Resolve version
         id: ver
         run: echo "v=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      # Attach the per-network maps to the release (operators can also mount these via
+      # LIGHT_NODE_INDEX_MAP instead of relying on the baked-in copy).
+      - name: Fetch maps
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: index-map-*
+          merge-multiple: true
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          files: |
+            *_index_map.bin
           body: |
             Trustless Mina light node — verify-before-ingest, configureless containers.
 
             ## Container images (GHCR)
-            One image per network; the network is baked in, so `docker run` needs no config:
+            One image per network; network + the baked pubkey→index map are built in, so
+            `docker run` needs no config and `/account?pubkey=` works without a cold sweep:
 
             ```
-            docker run --rm ghcr.io/o1-labs/mina-light-node:${{ steps.ver.outputs.v }}-devnet
-            docker run --rm ghcr.io/o1-labs/mina-light-node:${{ steps.ver.outputs.v }}-mainnet
+            docker run --rm -p 8645:8645 ghcr.io/o1-labs/mina-light-node:${{ steps.ver.outputs.v }}-devnet
+            docker run --rm -p 8645:8645 ghcr.io/o1-labs/mina-light-node:${{ steps.ver.outputs.v }}-mainnet
             ```
 
             Moving tags `:devnet` / `:mainnet` track the latest release per network.
+            The `*_index_map.bin` assets can also be mounted via `LIGHT_NODE_INDEX_MAP`.

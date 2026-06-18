@@ -1,32 +1,30 @@
 # Mina light node — joins p2p (mina-relay) + verifies every tip (mina-verify),
-# in-process. No sidecar, no configuration.
+# in-process. No sidecar, no runtime configuration.
 #
 # One process follows exactly ONE network: the libp2p pnet key is derived from the
-# chain id, so a devnet swarm cannot even decrypt mainnet traffic, and Mina's network
-# config is process-global (set once). So it's one container per network — same image,
-# different MINA_NETWORK. Both services below build the same image.
+# chain id (a devnet swarm can't even decrypt mainnet traffic) and Mina's network
+# config is process-global. So it's one container per network — and the network is
+# baked into the image at build time (--build-arg MINA_NETWORK), so the running
+# container needs no environment at all.
 #
 #   docker compose -f deploy/docker-compose.yml up --build            # devnet (default)
 #   docker compose -f deploy/docker-compose.yml --profile mainnet up  # mainnet
 services:
   devnet:
-    image: mina-light-node:latest
+    image: mina-light-node:devnet
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-    environment:
-      MINA_NETWORK: devnet
-      RUST_LOG: info
-      # LIGHT_NODE_SECS unset => run forever.
+      args:
+        MINA_NETWORK: devnet
     restart: unless-stopped
 
   mainnet:
-    image: mina-light-node:latest
+    image: mina-light-node:mainnet
     profiles: ["mainnet"]
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-    environment:
-      MINA_NETWORK: mainnet
-      RUST_LOG: info
+      args:
+        MINA_NETWORK: mainnet
     restart: unless-stopped

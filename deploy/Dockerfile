@@ -20,8 +20,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/mina-light-node /usr/local/bin/mina-light-node
-# Out of the box: connect to devnet seeds and verify forever, no configuration.
-# Switch networks with `-e MINA_NETWORK=mainnet`.
-ENV MINA_NETWORK=devnet
+# The network is baked at BUILD time, so the container is truly configureless —
+# `docker run` needs no env, no flags. One image == one network:
+#   docker build -t mina-light-node:devnet  .                               # devnet (default)
+#   docker build -t mina-light-node:mainnet --build-arg MINA_NETWORK=mainnet .
+#   docker run --rm mina-light-node:mainnet      # connects to mainnet, nothing to pass
+ARG MINA_NETWORK=devnet
+ENV MINA_NETWORK=${MINA_NETWORK}
 ENV RUST_LOG=info
 ENTRYPOINT ["mina-light-node"]

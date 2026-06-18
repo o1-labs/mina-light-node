@@ -32,25 +32,50 @@ from `mina-verify-capture`). The `mina-light-node` binary currently follows the
 gossip network and surfaces candidate tips; the verifier trust-gate, account reads,
 mempool tap, broadcast API, and liveness cross-check are TODOs (see `src/main.rs`).
 
+## Binaries
+
+| Binary | What |
+|---|---|
+| `mina-light-node` | Headless node: verify-before-ingest, surfaces the verified tip on stdout / `LIGHT_NODE_TIP_FILE`. |
+| `mina-light-node-server` | The node **+ a trustless HTTP API** (reads / submit / mempool) — what a Rosetta adapter or a client-side integrity monitor consumes. |
+
 ## Build / run
 
 ```sh
 cargo build
+# headless node
 MINA_NETWORK=devnet cargo run -p mina-light-node
+# node + trustless HTTP API on :8645
+MINA_NETWORK=devnet cargo run -p mina-light-node --bin mina-light-node-server
 ```
+
+### HTTP API (`mina-light-node-server`, env `LIGHT_NODE_HTTP_ADDR`, default `127.0.0.1:8645`)
+
+```sh
+curl :8645/health                  # {status, network, uptime_secs, verified, rejected, seconds_since_last_verified}
+curl :8645/tip                     # {height, state_hash, staking_epoch_ledger_hash}
+curl ':8645/account?index=0'       # trustless balance/nonce by leaf index (instant)
+curl ':8645/account?pubkey=B62…'   # by public key (resolved from the swept index map)
+curl :8645/mempool                 # best-effort pending tx ids
+curl -XPOST :8645/submit -d '{"tx_hex":"…"}'   # broadcast a signed user command
+```
+
+Every `/account` answer is Merkle-proved against the verified tip's **staking-epoch-ledger**
+root (what peers serve over sync-ledger), so a lying peer is rejected. By-public-key needs
+the `pubkey→index` map; the server builds it by sweeping the epoch ledger at cold start
+(minutes on a large ledger — the [baked S3 map](docs/) will remove this cold sweep).
 
 ## Roadmap (see the trustless-light-stack arch doc)
 
 - [x] Wire the **trust gate**: verify each gossiped block's proof before ingest
-      (`verify_tip` + `ChainMonitor`); validated on live devnet (h528196).
-- [ ] **Account reads**: Merkle-proof balances/nonce against the verified ledger root.
-      (Verify side exists in `mina-verify::verify_account_inclusion`; needs the account +
-      Merkle path fetched via the libp2p sync-ledger RPC.)
+      (`verify_tip` + `ChainMonitor`); validated on live devnet.
+- [x] **Account reads**: `GET /account?pubkey=&index=` Merkle-proves balance/nonce against
+      the verified staking-epoch-ledger root; validated on devnet (account 0 + by-pubkey).
 - [x] **Mempool tap**: tx-pool gossip → bounded, TTL'd view (`mempool::MempoolView`),
-      keyed by the canonical Mina tx hash (`MinaBaseUserCommandStableV2::hash()`, the
-      Rosetta `transaction_identifier`); validated on devnet.
-- [ ] **Broadcast**: publish signed txs to the tx-pool gossip topic.
-- [x] **Liveness cross-check** (expose side): the node emits its best proof-verified tip
-      as a structured stdout line + optional `LIGHT_NODE_TIP_FILE`; validated on devnet
-      (h528200). Consumers (e.g. the indexer) compare it vs a GCS tip to flag divergence.
-- [ ] HTTP/RPC surface + deploy glue (see `deploy/`).
+      keyed by the canonical Mina tx hash; `GET /mempool`.
+- [x] **Broadcast**: `POST /submit` publishes a signed tx to the tx-pool gossip topic.
+- [x] **Liveness cross-check** (expose side): `GET /tip` is the proof-verified tip a
+      consumer compares against a less-trusted source to flag divergence.
+- [x] **HTTP/RPC surface** + deploy glue (`mina-light-node-server`, see `deploy/`).
+- [ ] **Baked `pubkey→index` map** from the S3 epoch-ledger tarball at release time
+      (removes the cold-start sweep). - [ ] Optional **GraphQL facade** for existing Mina clients.

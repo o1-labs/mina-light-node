@@ -1,12 +1,32 @@
-# Mina light node — joins p2p (mina-relay) + verifies (mina-verify).
-# TODO: add the verify sidecar (MinaProtocol/mina-verify mina-verify-server) once
-# the trust gate is wired, or run verification in-process.
+# Mina light node — joins p2p (mina-relay) + verifies every tip (mina-verify),
+# in-process. No sidecar, no configuration.
+#
+# One process follows exactly ONE network: the libp2p pnet key is derived from the
+# chain id, so a devnet swarm cannot even decrypt mainnet traffic, and Mina's network
+# config is process-global (set once). So it's one container per network — same image,
+# different MINA_NETWORK. Both services below build the same image.
+#
+#   docker compose -f deploy/docker-compose.yml up --build            # devnet (default)
+#   docker compose -f deploy/docker-compose.yml --profile mainnet up  # mainnet
 services:
-  mina-light-node:
+  devnet:
+    image: mina-light-node:latest
     build:
       context: ..
       dockerfile: deploy/Dockerfile
     environment:
       MINA_NETWORK: devnet
+      RUST_LOG: info
+      # LIGHT_NODE_SECS unset => run forever.
+    restart: unless-stopped
+
+  mainnet:
+    image: mina-light-node:latest
+    profiles: ["mainnet"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      MINA_NETWORK: mainnet
       RUST_LOG: info
     restart: unless-stopped

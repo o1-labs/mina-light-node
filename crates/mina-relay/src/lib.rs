@@ -76,6 +76,16 @@ pub fn network_seeds(network: &str) -> Option<(&'static str, &'static [&'static 
     }
 }
 
+/// Whether a raw consensus-gossip payload is a `NewState` (block) message.
+///
+/// The on-wire form is `[8-byte LE length][GossipNetMessageV2 binprot]`; the binprot
+/// enum tag sits at offset 8 and `0` is the `NewState` variant (1 = snark-pool diff,
+/// 2 = tx-pool diff). A full decode happens later in the verifier — this is the cheap
+/// prefilter [`subscribe_blocks`] uses to skip non-block traffic.
+pub fn is_new_state_payload(data: &[u8]) -> bool {
+    data.get(8) == Some(&0)
+}
+
 /// Connect to a Mina network over gossip and invoke `on_block` with the raw gossip
 /// payload of each `NewState` (block). Thin wrapper over [`subscribe_gossip`] that
 /// filters to the block tag (`0`); the payload is in the exact form
@@ -95,8 +105,7 @@ pub async fn subscribe_blocks<F, T>(
         peers,
         deadline,
         |data| {
-            // tag at offset 8: 0 = NewState (block).
-            if data.get(8) == Some(&0) {
+            if is_new_state_payload(data) {
                 on_block(data)
             } else {
                 ControlFlow::Continue(())
@@ -208,5 +217,56 @@ pub async fn subscribe_gossip<F, T>(
                 None => break,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libp2p::Multiaddr;
+
+    #[test]
+    fn network_seeds_known_networks() {
+        for net in ["devnet", "mainnet", "mesa-mut"] {
+            let (chain_id, peers) = network_seeds(net).expect("known network");
+            assert!(!peers.is_empty(), "{net} has seed peers");
+            // chain id is a 32-byte hash rendered as 64 lowercase hex chars.
+            assert_eq!(chain_id.len(), 64, "{net} chain id is 64 hex chars");
+            assert!(
+                chain_id.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{net} chain id is hex",
+            );
+        }
+    }
+
+    #[test]
+    fn network_seeds_unknown_is_none() {
+        assert!(network_seeds("nope").is_none());
+        assert!(network_seeds("").is_none());
+    }
+
+    #[test]
+    fn all_seed_peers_parse_as_multiaddrs() {
+        // subscribe_gossip/fetch_best_tip `.parse().expect(...)` these; a malformed
+        // constant would panic only at runtime, so pin it down here.
+        for net in ["devnet", "mainnet", "mesa-mut"] {
+            let (_, peers) = network_seeds(net).unwrap();
+            for p in peers {
+                p.parse::<Multiaddr>()
+                    .unwrap_or_else(|e| panic!("{net} peer {p:?} is a valid multiaddr: {e}"));
+            }
+        }
+    }
+
+    #[test]
+    fn new_state_prefilter() {
+        // tag byte 0 at offset 8 = NewState (block).
+        assert!(is_new_state_payload(&[0, 0, 0, 0, 0, 0, 0, 0, 0]));
+        // a non-zero tag (snark/tx-pool diff) is not a block.
+        assert!(!is_new_state_payload(&[0, 0, 0, 0, 0, 0, 0, 0, 1]));
+        assert!(!is_new_state_payload(&[0, 0, 0, 0, 0, 0, 0, 0, 2]));
+        // too short to carry a tag.
+        assert!(!is_new_state_payload(&[0, 0, 0, 0]));
+        assert!(!is_new_state_payload(&[]));
     }
 }

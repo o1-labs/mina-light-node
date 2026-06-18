@@ -10,8 +10,12 @@ use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use mina_relay::rpc_net::{fetch_best_tip, fetch_sync_ledger_answers};
 use mina_relay::{network_seeds, subscribe_blocks};
-use mina_verify::{block_from_gossip_payload, Verifier};
+use mina_verify::{
+    block_from_gossip_payload, staking_epoch_ledger_hash, sync_ledger_queries,
+    verify_account_at_root, Verifier, LEDGER_DEPTH,
+};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "hits the live devnet p2p network; run with --ignored"]
@@ -44,5 +48,42 @@ async fn devnet_tip_verifies_end_to_end() {
     assert!(
         verifier.verify_block(&block),
         "a live devnet tip's proof must verify",
+    );
+}
+
+/// Trustless account read end-to-end (the path `GET /account?index=` runs): fetch +
+/// verify the tip, walk the sync-ledger for account 0, fold to the verified staking-
+/// epoch-ledger root. Account 0 is the well-known devnet account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "hits the live devnet p2p network; run with --ignored"]
+async fn devnet_account0_balance_is_proof_backed() {
+    let (chain_id, peers) = network_seeds("devnet").expect("devnet seeds");
+
+    let block = fetch_best_tip(chain_id, peers, Duration::from_secs(120))
+        .await
+        .expect("fetch best tip");
+    assert!(
+        Verifier::devnet().verify_block(&block),
+        "tip proof must verify before reading against it",
+    );
+    let root = staking_epoch_ledger_hash(&block);
+
+    let queries = sync_ledger_queries(0, LEDGER_DEPTH);
+    let answers = fetch_sync_ledger_answers(
+        chain_id,
+        peers,
+        root.clone(),
+        &queries,
+        Duration::from_secs(120),
+    )
+    .await
+    .expect("sync-ledger answers");
+
+    let account = verify_account_at_root(&root, 0, LEDGER_DEPTH, &answers)
+        .expect("account proven at index 0");
+    assert_eq!(
+        account.public_key.into_address(),
+        "B62qiy32p8kAKnny8ZFwoMhYpBppM1DWVCqAPBYNcXnsAHhnfAAuXgg",
+        "devnet account 0 public key",
     );
 }

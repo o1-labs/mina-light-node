@@ -19,8 +19,13 @@ use libp2p::swarm::{
 use libp2p::{Multiaddr, PeerId};
 use void::Void;
 
+use crate::rpc::RpcConn;
 use crate::transport::ed25519::{Keypair as EdKeypair, SecretKey};
-use mina_p2p_messages::v2::MinaBlockBlockStableV2;
+use mina_p2p_messages::rpc::AnswerSyncLedgerQueryV2;
+use mina_p2p_messages::v2::{
+    LedgerHash, MinaBlockBlockStableV2, MinaLedgerSyncLedgerAnswerStableV2,
+    MinaLedgerSyncLedgerQueryStableV1,
+};
 
 const RPC_PROTOCOL: StreamProtocol = StreamProtocol::new("coda/rpcs/0.0.1");
 
@@ -180,5 +185,69 @@ pub async fn fetch_best_tip(
     tokio::select! {
         r = run => r,
         _ = tokio::time::sleep(deadline) => Err("deadline reached before fetching best tip".into()),
+    }
+}
+
+/// Connect to a peer and run a batch of `answer_sync_ledger_query` RPCs against a given
+/// ledger `root`, returning the answers in query order. Used for trustless account reads:
+/// the queries walk an account's Merkle path + leaf; the caller folds the answers back to
+/// `root` (a field of an already-verified block) to catch any lying peer.
+pub async fn fetch_sync_ledger_answers(
+    chain_id: &str,
+    peers: &[&str],
+    ledger_hash: LedgerHash,
+    queries: &[MinaLedgerSyncLedgerQueryStableV1],
+    deadline: Duration,
+) -> Result<Vec<MinaLedgerSyncLedgerAnswerStableV2>, String> {
+    let addrs: Vec<Multiaddr> = peers
+        .iter()
+        .map(|s| s.parse().expect("multiaddr"))
+        .collect();
+    let local_key: libp2p::identity::Keypair = EdKeypair::from(SecretKey::generate()).into();
+    let pnet_input = format!("/coda/0.0.1/{chain_id}");
+
+    let mut swarm = crate::transport::swarm(
+        local_key,
+        pnet_input.as_bytes(),
+        Vec::<Multiaddr>::new(),
+        addrs.iter().cloned(),
+        RpcBehaviour::default(),
+    );
+
+    let root = ledger_hash.0.clone();
+
+    let run = async {
+        let stream = loop {
+            if let Some(SwarmEvent::Behaviour(stream)) = swarm.next().await {
+                break stream;
+            }
+        };
+        // Reuse one RPC connection for the whole walk (one query per Merkle level + leaf).
+        let walk = async {
+            let mut conn = RpcConn::open(stream).await?;
+            let mut answers = Vec::with_capacity(queries.len());
+            for query in queries {
+                let resp = conn
+                    .call::<AnswerSyncLedgerQueryV2>(&(root.clone(), query.clone()))
+                    .await?;
+                let answer = resp
+                    .0
+                    .map_err(|e| format!("sync-ledger rpc error: {e:?}"))?;
+                answers.push(answer);
+            }
+            Ok::<_, String>(answers)
+        };
+        let mut walk = std::pin::pin!(walk);
+        loop {
+            tokio::select! {
+                _ = swarm.next() => {}
+                r = &mut walk => return r,
+            }
+        }
+    };
+
+    tokio::select! {
+        r = run => r,
+        _ = tokio::time::sleep(deadline) => Err("deadline reached before sync-ledger answers".into()),
     }
 }

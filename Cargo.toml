@@ -15,7 +15,7 @@ mina-relay = { path = "crates/mina-relay" }
 # same openmina rev (o1-labs/mina-rust@ab69eaed) as mina-relay below, so the
 # mina-p2p-messages subtree unifies. proof-systems (0.3.0) + the num-bigint patches
 # come transitively from mina-verify's workspace.
-mina-verify = { git = "https://github.com/MinaProtocol/mina-verify", rev = "52fe76475349927591162a27f7512f1ce453d225" }
+mina-verify = { git = "https://github.com/MinaProtocol/mina-verify", rev = "ab52b343f5efb2a7a214c0fb1e21353385718953" }
 
 # openmina message types (proof-systems-agnostic subset used by mina-relay) — must
 # match mina-verify's rev so the graph unifies on one mina-p2p-messages.
@@ -29,6 +29,11 @@ hex = "0.4"
 pin-project-lite = "0.2"
 env_logger = "0.11"
 log = "0.4"
+
+# HTTP query surface (mina-light-node-server): trustless reads / submit / mempool.
+axum = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Required by mina-p2p-messages' dep tree (multihash 0.18 -> yanked core2 0.4.0).
 [patch.crates-io]

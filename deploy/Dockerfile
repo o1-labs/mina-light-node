@@ -28,4 +28,6 @@ COPY --from=build /src/target/release/mina-light-node /usr/local/bin/mina-light-
 ARG MINA_NETWORK=devnet
 ENV MINA_NETWORK=${MINA_NETWORK}
 ENV RUST_LOG=info
+# Read-only HTTP query surface (GET /tip, /healthz). Publish with `-p 8080:8080`.
+EXPOSE 8080
 ENTRYPOINT ["mina-light-node"]

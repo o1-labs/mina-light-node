@@ -39,6 +39,24 @@ cargo build
 MINA_NETWORK=devnet cargo run -p mina-light-node
 ```
 
+## Query surface (HTTP)
+
+A small read-only HTTP server (env `BIND`, default `0.0.0.0:8080`) exposes the
+proof-verified state:
+
+```sh
+curl localhost:8080/tip
+# {"height":529001,"state_hash":"3NKRN1Q…","network":"devnet"}  (503 until the first tip)
+
+curl localhost:8080/healthz
+# {"status":"ok","network":"devnet","uptime_secs":116,"verified":1,"rejected":0,
+#  "seconds_since_last_verified":2}
+```
+
+Every value behind `/tip` passed the SNARK proof check, so it is a *trustless* answer
+to "what is the real current chain tip?" — the anchor a client-side integrity monitor
+cross-checks a trusted-but-unverified source (RPC, Rosetta, GCS) against.
+
 ## Roadmap (see the trustless-light-stack arch doc)
 
 - [x] Wire the **trust gate**: verify each gossiped block's proof before ingest
@@ -53,4 +71,5 @@ MINA_NETWORK=devnet cargo run -p mina-light-node
 - [x] **Liveness cross-check** (expose side): the node emits its best proof-verified tip
       as a structured stdout line + optional `LIGHT_NODE_TIP_FILE`; validated on devnet
       (h528200). Consumers (e.g. the indexer) compare it vs a GCS tip to flag divergence.
-- [ ] HTTP/RPC surface + deploy glue (see `deploy/`).
+- [~] HTTP/RPC surface + deploy glue (see `deploy/`). `GET /tip` + `GET /healthz`
+      done (port 8080, exposed in the image); account/mempool endpoints pending.

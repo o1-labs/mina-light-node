@@ -15,3 +15,7 @@ mina-verify = { workspace = true }
 tokio = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
+# Small synchronous HTTP server for the query surface (GET /tip, /healthz). Runs on its
+# own thread alongside the gossip loop + verify worker — no async runtime needed for it.
+tiny_http = "0.12"
+serde_json = "1"

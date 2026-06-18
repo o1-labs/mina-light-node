@@ -9,6 +9,9 @@
 #
 #   docker compose -f deploy/docker-compose.yml up --build            # devnet (default)
 #   docker compose -f deploy/docker-compose.yml --profile mainnet up  # mainnet
+#
+# Query surface: GET http://localhost:8080/tip and /healthz (devnet),
+#                GET http://localhost:8081/tip and /healthz (mainnet).
 services:
   devnet:
     image: mina-light-node:devnet
@@ -17,6 +20,8 @@ services:
       dockerfile: deploy/Dockerfile
       args:
         MINA_NETWORK: devnet
+    ports:
+      - "8080:8080"
     restart: unless-stopped
 
   mainnet:
@@ -27,4 +32,6 @@ services:
       dockerfile: deploy/Dockerfile
       args:
         MINA_NETWORK: mainnet
+    ports:
+      - "8081:8080"
     restart: unless-stopped

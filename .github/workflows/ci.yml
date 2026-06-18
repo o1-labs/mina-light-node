@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Daily 06:00 UTC — run the live-devnet e2e to catch protocol/seed drift.
+    - cron: "0 6 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+  # proof-systems / kimchi (pulled in via mina-verify) need a C toolchain + openssl.
+  SYSTEM_DEPS: build-essential pkg-config libssl-dev
+
+# Cancel superseded runs on the same ref (heavy proof-systems builds — don't pile up).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  format:
+    name: format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins the toolchain (1.94.1 + rustfmt + clippy).
+      # fmt parses source only — no dependency build needed, so this gate is fast.
+      - name: Format
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $SYSTEM_DEPS
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $SYSTEM_DEPS
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --workspace --locked
+      - name: Test (unit + integration; the live-network e2e is #[ignore]d)
+        run: cargo test --workspace --locked
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $SYSTEM_DEPS
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-tarpaulin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
+      # Owned crates only (deps aren't instrumented). transport.rs is vendored from
+      # o1-labs/mina-rust and kept close to upstream, so it's excluded. The live-network
+      # e2e stays ignored. Reported, not gated — add `--fail-under <n>` to make it block.
+      - name: Coverage
+        run: |
+          cargo tarpaulin \
+            -p mina-relay -p mina-light-node \
+            --locked --timeout 300 \
+            --exclude-files 'crates/mina-relay/src/transport.rs' \
+            --out Xml --out Html --out Stdout | tee coverage.txt
+      - name: Coverage summary
+        if: always()
+        run: |
+          echo '### Coverage' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E '^[0-9.]+% coverage|Coverage Results|\|\| ' coverage.txt | tail -40 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            cobertura.xml
+            tarpaulin-report.html
+
+  # The end-to-end test joins the live devnet p2p network, so it can't run on a
+  # standard PR. Run it on a schedule (and on demand) to catch protocol/seed drift.
+  e2e-devnet:
+    name: e2e (live devnet)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $SYSTEM_DEPS
+      - uses: Swatinem/rust-cache@v2
+      - name: Live devnet trust-gate e2e
+        run: cargo test -p mina-light-node --test devnet_e2e --locked -- --ignored --nocapture

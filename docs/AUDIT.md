@@ -94,8 +94,9 @@ Previously: **zero tests anywhere**. Added in this PR:
 ### Coverage recommendations (not yet done)
 - A `ChainMonitor` reorg/fork unit test belongs in `mina-verify` (it owns the type).
 - A `mempool` view test (dedup / TTL eviction) in `mina-relay`.
-- **Add CI** (none exists): `cargo fmt --check`, `clippy -D warnings`, `cargo test`,
-  and the `--ignored` e2e on a schedule.
+- **CI added** (`.github/workflows/ci.yml`): `cargo fmt --check`, `clippy -D warnings`,
+  `cargo test`, `cargo tarpaulin` coverage (reported, not yet gated), and the
+  `--ignored` live-devnet e2e on a daily schedule.
 
 ## Deploy note
 `LIGHT_NODE_SECS` is now optional (unset = run forever) so the deployed node no longer

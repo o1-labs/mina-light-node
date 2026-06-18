@@ -1,0 +1,92 @@
+name: Release
+
+# On a v* tag: build one image per network (the network is baked at build time via
+# --build-arg) and push to GHCR, then publish a GitHub Release. Also runnable manually
+# (workflow_dispatch) with an explicit version for a dry-run / re-push.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to tag images with (e.g. 0.0.1)"
+        required: true
+
+permissions:
+  contents: write   # create the GitHub Release
+  packages: write   # push images to GHCR
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}   # ghcr.io/o1-labs/mina-light-node
+
+jobs:
+  images:
+    name: image (${{ matrix.network }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        network: [devnet, mainnet]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            v="${{ inputs.version }}"
+          else
+            v="${GITHUB_REF_NAME#v}"   # v0.0.1 -> 0.0.1
+          fi
+          echo "v=$v" >> "$GITHUB_OUTPUT"
+          echo "building $IMAGE:${v}-${{ matrix.network }}"
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # One image per network: <version>-<network> (immutable) + <network> (moving).
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          build-args: |
+            MINA_NETWORK=${{ matrix.network }}
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.ver.outputs.v }}-${{ matrix.network }}
+            ${{ env.IMAGE }}:${{ matrix.network }}
+          cache-from: type=gha,scope=${{ matrix.network }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.network }}
+          provenance: false
+
+  release:
+    name: github release
+    needs: images
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve version
+        id: ver
+        run: echo "v=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            Trustless Mina light node — verify-before-ingest, configureless containers.
+
+            ## Container images (GHCR)
+            One image per network; the network is baked in, so `docker run` needs no config:
+
+            ```
+            docker run --rm ghcr.io/o1-labs/mina-light-node:${{ steps.ver.outputs.v }}-devnet
+            docker run --rm ghcr.io/o1-labs/mina-light-node:${{ steps.ver.outputs.v }}-mainnet
+            ```
+
+            Moving tags `:devnet` / `:mainnet` track the latest release per network.

@@ -52,7 +52,9 @@ MINA_NETWORK=devnet cargo run -p mina-light-node --bin mina-light-node-server
 ### HTTP API (`mina-light-node-server`, env `LIGHT_NODE_HTTP_ADDR`, default `127.0.0.1:8645`)
 
 ```sh
-curl :8645/health                  # {status, network, uptime_secs, verified, rejected, seconds_since_last_verified}
+curl :8645/health                  # liveness + verify counters + sync freshness
+curl :8645/status                  # chain health: height, epoch, global_slot, min_window_density, reorgs, forks
+curl :8645/metrics                 # Prometheus exposition (scrape for the integrity monitor)
 curl :8645/tip                     # {height, state_hash, staking_epoch_ledger_hash}
 curl ':8645/account?index=0'       # trustless balance/nonce by leaf index (instant)
 curl ':8645/account?pubkey=B62…'   # by public key (resolved from the swept index map)
@@ -62,6 +64,18 @@ curl -XPOST :8645/submit -d '{"tx_hex":"…"}'   # broadcast a signed user comma
 
 Every `/account` answer is Merkle-proved against the verified tip's **staking-epoch-ledger**
 root (what peers serve over sync-ledger), so a lying peer is rejected.
+
+### Client-side integrity monitor
+
+`/status` + `/metrics` make the node a **trustless system-integrity monitor**: it independently
+proves the real chain and exposes the signals to alert on. The tip is fork-choice-tracked
+(`ChainMonitor`), so reorgs/forks are counted, not just height. Example Prometheus alerts:
+`mina_light_node_seconds_since_last_verified` high (chain stalled / node eclipsed),
+`mina_light_node_reorgs_total` rising (deep reorgs), `mina_light_node_min_window_density` low
+(chain-quality / censorship), `mina_light_node_rejected_total` > 0 (a peer served bad proofs).
+Cross-check your Rosetta/RPC tip against `/tip` (and balances against `/account`) to catch a
+stale or lying provider. If the verifier can't be built the process exits non-zero (it never
+runs "healthy" while verifying nothing).
 
 ### Baked `pubkey → index` map
 

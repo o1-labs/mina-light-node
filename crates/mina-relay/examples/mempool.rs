@@ -21,11 +21,12 @@ async fn main() {
     let mut view = MempoolView::new(4096, Duration::from_secs(600));
     eprintln!("tapping {network} tx-pool gossip for {secs}s (best-effort, untrusted)...");
 
+    let (_ban_tx, ban_rx) = tokio::sync::mpsc::unbounded_channel();
     subscribe_gossip(
         chain_id,
         peers,
         Some(Duration::from_secs(secs)),
-        |payload| {
+        |_src, payload| {
             let added = view.ingest_gossip(payload);
             if added > 0 {
                 eprintln!("  +{added} pending tx  (mempool view now: {})", view.len());
@@ -33,6 +34,7 @@ async fn main() {
             ControlFlow::Continue(())
         },
         |_peers| ControlFlow::Continue(()),
+        ban_rx,
     )
     .await;
 

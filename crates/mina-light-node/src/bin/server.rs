@@ -35,7 +35,7 @@ use mina_p2p_messages::binprot::BinProtRead;
 use mina_p2p_messages::v2::MinaBaseUserCommandStableV2;
 use mina_relay::broadcast::broadcast_tx;
 use mina_relay::mempool::MempoolView;
-use mina_relay::{network_seeds, rpc_net, subscribe_gossip};
+use mina_relay::{network_seeds, rpc_net, subscribe_gossip, PeerId};
 use mina_verify::{
     block_from_gossip_payload, staking_epoch_ledger_hash, sync_ledger_queries,
     verify_account_at_root, Block, ChainMonitor, Ingest, Verifier, LEDGER_DEPTH,
@@ -74,6 +74,9 @@ struct AppState {
     /// competing forks seen — finality/safety signals for the integrity monitor.
     reorgs: AtomicU64,
     forks: AtomicU64,
+    /// Connected peer count (live) and peers banned for relaying invalid-proof blocks.
+    peer_count: AtomicU64,
+    banned: AtomicU64,
     /// Unix seconds of the last successful verification (0 = none yet) — sync freshness.
     last_verified_unix: AtomicU64,
 }
@@ -121,6 +124,8 @@ async fn main() {
         rejected: AtomicU64::new(0),
         reorgs: AtomicU64::new(0),
         forks: AtomicU64::new(0),
+        peer_count: AtomicU64::new(0),
+        banned: AtomicU64::new(0),
         last_verified_unix: AtomicU64::new(0),
     });
 
@@ -147,8 +152,12 @@ async fn main() {
         }
     }
 
-    // Verify-before-tip worker thread (multi-second crypto, off the async runtime).
-    let (block_tx, block_rx) = mpsc::channel::<Vec<u8>>();
+    // Verify-before-tip worker thread (multi-second crypto, off the async runtime). Each
+    // block carries the peer that relayed it, so the worker can ban repeat offenders.
+    let (block_tx, block_rx) = mpsc::channel::<(PeerId, Vec<u8>)>();
+    // Reactive verification: the worker asks the gossip loop to disconnect+blocklist a
+    // peer once it relays too many invalid-proof blocks.
+    let (ban_tx, ban_rx) = tokio::sync::mpsc::unbounded_channel::<PeerId>();
     {
         let net = network.clone();
         let state = state.clone();
@@ -166,7 +175,11 @@ async fn main() {
             // Fork-choice-aware tip tracking: classify each verified tip (extend / reorg /
             // fork / behind) instead of a naive height compare, so reorgs are detected.
             let mut monitor = ChainMonitor::new(512);
-            while let Ok(payload) = block_rx.recv() {
+            // Invalid-proof strikes per relaying peer; ban after BAN_THRESHOLD (a few, not
+            // one — an honest peer may relay a block it hadn't fully validated).
+            const BAN_THRESHOLD: u32 = 3;
+            let mut strikes: HashMap<PeerId, u32> = HashMap::new();
+            while let Ok((src, payload)) = block_rx.recv() {
                 let block = match block_from_gossip_payload(&payload) {
                     Ok(b) => b,
                     Err(_) => continue,
@@ -217,7 +230,12 @@ async fn main() {
                     }
                     Ok(None) => {
                         state.rejected.fetch_add(1, Ordering::Relaxed);
-                        log::warn!("rejected invalid block proof — not adopting as tip");
+                        let n = strikes.entry(src).and_modify(|n| *n += 1).or_insert(1);
+                        log::warn!("rejected invalid block proof from {src} (strike {n})");
+                        if *n == BAN_THRESHOLD {
+                            state.banned.fetch_add(1, Ordering::Relaxed);
+                            let _ = ban_tx.send(src); // evict: disconnect + blocklist
+                        }
                     }
                     Err(e) => log::debug!("malformed block (skipped): {e:?}"),
                 }
@@ -229,14 +247,15 @@ async fn main() {
     {
         let state = state.clone();
         tokio::spawn(async move {
+            let tick_state = state.clone();
             subscribe_gossip(
                 chain_id,
                 peers,
                 None,
-                |payload| {
+                |src, payload| {
                     match payload.get(8) {
                         Some(0) => {
-                            let _ = block_tx.send(payload.to_vec());
+                            let _ = block_tx.send((src, payload.to_vec()));
                         }
                         Some(2) => {
                             state.mempool.lock().unwrap().ingest_gossip(payload);
@@ -245,7 +264,11 @@ async fn main() {
                     }
                     ControlFlow::Continue(())
                 },
-                |_| ControlFlow::Continue(()),
+                move |n| {
+                    tick_state.peer_count.store(n as u64, Ordering::Relaxed);
+                    ControlFlow::Continue(())
+                },
+                ban_rx,
             )
             .await;
         });
@@ -363,10 +386,12 @@ struct StatusResponse {
     min_window_density: u32,
     staking_epoch_ledger_hash: String,
     // node / monitor
+    peers: u64,
     verified: u64,
     rejected: u64,
     reorgs: u64,
     forks: u64,
+    banned: u64,
     uptime_secs: u64,
     /// Sync freshness; `null` until the first verified tip.
     seconds_since_last_verified: Option<u64>,
@@ -390,10 +415,12 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<StatusRespons
         global_slot: cs.global_slot_since_genesis.as_u32(),
         min_window_density: cs.min_window_density.as_u32(),
         staking_epoch_ledger_hash: staking_epoch_ledger_hash(&tip.block).to_string(),
+        peers: state.peer_count.load(Ordering::Relaxed),
         verified: state.verified.load(Ordering::Relaxed),
         rejected: state.rejected.load(Ordering::Relaxed),
         reorgs: state.reorgs.load(Ordering::Relaxed),
         forks: state.forks.load(Ordering::Relaxed),
+        banned: state.banned.load(Ordering::Relaxed),
         uptime_secs: state.started.elapsed().as_secs(),
         seconds_since_last_verified: (last != 0).then(|| now_unix().saturating_sub(last)),
     }))
@@ -452,6 +479,20 @@ async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "counter",
         "competing forks seen",
         state.forks.load(Ordering::Relaxed),
+    );
+    m(
+        &mut s,
+        "mina_light_node_peers",
+        "gauge",
+        "connected peers",
+        state.peer_count.load(Ordering::Relaxed),
+    );
+    m(
+        &mut s,
+        "mina_light_node_banned_total",
+        "counter",
+        "peers banned for relaying invalid-proof blocks",
+        state.banned.load(Ordering::Relaxed),
     );
 
     let last = state.last_verified_unix.load(Ordering::Relaxed);

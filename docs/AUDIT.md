@@ -14,7 +14,7 @@ absence of tests (first tests added in this PR).
 | Finding | Severity | Status |
 |---|---|---|
 | S1 RPC frame alloc unbounded from untrusted length prefix | high (remote DoS) | **FIXED here** |
-| S2 verify-worker panic is silent — node runs but verifies nothing | medium | flagged (see below) |
+| S2 verify-worker panic is silent — node runs but verifies nothing | medium | **FIXED** (server: fail loud) |
 | S3 `.parse().expect()` panics on bad peer multiaddr | low | open, mitigated by test |
 | S4 `dial()/listen_on().unwrap()` panic on setup error | low | open |
 | S5 re-dial-all seeds on every disconnect | low | open |
@@ -32,16 +32,15 @@ OOM/abort the process before any data arrived.
 oversized prefixes return an error instead of allocating. Covered by
 `oversized_frame_is_rejected_not_allocated` (a mock stream feeding `u64::MAX`).
 
-### S2 — Verify-worker panic is silent. FLAGGED (not changed here)
-In `main.rs`, the worker thread does `Verifier::for_network(&net).expect(...)`. If
-the verifier can't be built (e.g. an unsupported network, or a VK load failure), the
-worker **panics and dies**, the channel receiver drops, and the gossip loop's
-`let _ = tx.send(...)` then **fails silently** — the process stays alive, connected
-to peers, but verifies *nothing*. A "trustless node" that has quietly stopped
-verifying is worse than one that crashes.
-*Recommended fix (left for a focused follow-up to avoid touching the hot path here):*
-propagate the verifier-build error to the main task and exit non-zero, or stop the
-gossip loop when `tx.send` errors (return `ControlFlow::Break`).
+### S2 — Verify-worker panic is silent. FIXED (in `mina-light-node-server`)
+If the verifier can't be built (unsupported network, VK load failure), the worker
+thread would panic and die, the channel receiver drop, and the gossip loop's
+`let _ = tx.send(...)` then **fail silently** — the process staying alive but verifying
+*nothing*, which is worse than crashing.
+*Fix:* `server.rs` builds the verifier via `build_verifier()` and, on error, logs a
+fatal line and `std::process::exit(1)` — it never runs "healthy" while verifying
+nothing. (The legacy `main.rs` headless node still uses `expect`; the server is the
+shipped product. Apply the same to `main.rs` if it stays in use.)
 
 ### S3 — `.parse().expect(...)` on peer multiaddrs. OPEN (low; mitigated)
 `subscribe_gossip` / `fetch_best_tip` panic on a malformed peer string. The shipped

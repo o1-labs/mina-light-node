@@ -27,6 +27,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use mina_light_node::{index_map, sweep_index_map};
@@ -37,7 +38,7 @@ use mina_relay::mempool::MempoolView;
 use mina_relay::{network_seeds, rpc_net, subscribe_gossip};
 use mina_verify::{
     block_from_gossip_payload, staking_epoch_ledger_hash, sync_ledger_queries,
-    verify_account_at_root, Block, Verifier, LEDGER_DEPTH,
+    verify_account_at_root, Block, ChainMonitor, Ingest, Verifier, LEDGER_DEPTH,
 };
 use serde::{Deserialize, Serialize};
 
@@ -69,8 +70,25 @@ struct AppState {
     index: RwLock<Option<IndexCache>>,
     verified: AtomicU64,
     rejected: AtomicU64,
+    /// Reorgs (the new tip won fork-choice over a competing branch) and non-winning
+    /// competing forks seen — finality/safety signals for the integrity monitor.
+    reorgs: AtomicU64,
+    forks: AtomicU64,
     /// Unix seconds of the last successful verification (0 = none yet) — sync freshness.
     last_verified_unix: AtomicU64,
+}
+
+/// Build the network verifier — from `MINA_VK_JSON` (a caller-supplied verifier-index,
+/// for networks without an embedded VK) if set, else the embedded VK for `network`.
+fn build_verifier(network: &str) -> Result<Verifier, String> {
+    match std::env::var("MINA_VK_JSON") {
+        Ok(path) => {
+            let json = std::fs::read_to_string(&path)
+                .map_err(|e| format!("read MINA_VK_JSON {path}: {e}"))?;
+            Verifier::with_index_json(&json).map_err(|e| e.to_string())
+        }
+        Err(_) => Verifier::for_network(network).map_err(|e| e.to_string()),
+    }
 }
 
 fn now_unix() -> u64 {
@@ -101,6 +119,8 @@ async fn main() {
         index: RwLock::new(None),
         verified: AtomicU64::new(0),
         rejected: AtomicU64::new(0),
+        reorgs: AtomicU64::new(0),
+        forks: AtomicU64::new(0),
         last_verified_unix: AtomicU64::new(0),
     });
 
@@ -133,13 +153,19 @@ async fn main() {
         let net = network.clone();
         let state = state.clone();
         std::thread::spawn(move || {
-            let verifier = match std::env::var("MINA_VK_JSON") {
-                Ok(path) => Verifier::with_index_json(
-                    &std::fs::read_to_string(&path).expect("read MINA_VK_JSON"),
-                )
-                .expect("verifier from VK json"),
-                Err(_) => Verifier::for_network(&net).expect("verifier"),
+            // Fail loud if we can't build a verifier — a light *node* that can't verify
+            // is just an untrusted relay. (Without this the thread would die and the
+            // process would stay "healthy" while verifying nothing — audit finding S2.)
+            let verifier = match build_verifier(&net) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::error!("fatal: cannot build verifier for {net:?}: {e}");
+                    std::process::exit(1);
+                }
             };
+            // Fork-choice-aware tip tracking: classify each verified tip (extend / reorg /
+            // fork / behind) instead of a naive height compare, so reorgs are detected.
+            let mut monitor = ChainMonitor::new(512);
             while let Ok(payload) = block_rx.recv() {
                 let block = match block_from_gossip_payload(&payload) {
                     Ok(b) => b,
@@ -153,16 +179,40 @@ async fn main() {
                             .last_verified_unix
                             .store(now_unix(), Ordering::Relaxed);
                         let height = t.height();
-                        let info = TipInfo {
-                            state_hash: t.state_hash().to_string(),
-                            block: t.block().clone(),
-                            height,
-                        };
-                        let mut tip = state.tip.write().unwrap();
-                        // Only advance forward (ignore older/equal gossiped blocks).
-                        if tip.as_ref().map(|t| height > t.height).unwrap_or(true) {
+                        let outcome = monitor.ingest(&t);
+                        match &outcome {
+                            Ingest::Reorg {
+                                depth,
+                                common_ancestor,
+                                ..
+                            } => {
+                                state.reorgs.fetch_add(1, Ordering::Relaxed);
+                                log::warn!(
+                                    "REORG to h{height} (rolled back {}, diverged at {})",
+                                    depth.map_or("?".into(), |d| d.to_string()),
+                                    common_ancestor.as_deref().unwrap_or("<unknown>"),
+                                );
+                            }
+                            Ingest::Fork { common_ancestor } => {
+                                state.forks.fetch_add(1, Ordering::Relaxed);
+                                log::warn!(
+                                    "competing FORK at h{height} (diverged at {})",
+                                    common_ancestor.as_deref().unwrap_or("<unknown>"),
+                                );
+                            }
+                            _ => {}
+                        }
+                        // Adopt the new best only when fork-choice says so.
+                        if matches!(
+                            outcome,
+                            Ingest::Genesis | Ingest::Extend { .. } | Ingest::Reorg { .. }
+                        ) {
                             log::info!("verified tip h{height}");
-                            *tip = Some(info);
+                            *state.tip.write().unwrap() = Some(TipInfo {
+                                state_hash: t.state_hash().to_string(),
+                                block: t.block().clone(),
+                                height,
+                            });
                         }
                     }
                     Ok(None) => {
@@ -246,6 +296,8 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/healthz", get(health))
+        .route("/status", get(status))
+        .route("/metrics", get(metrics))
         .route("/tip", get(tip))
         .route("/account", get(account))
         .route("/mempool", get(mempool))
@@ -297,6 +349,160 @@ async fn tip(State(state): State<Arc<AppState>>) -> Result<Json<TipResponse>, Ap
         state_hash: tip.state_hash,
         staking_epoch_ledger_hash: staking_epoch_ledger_hash(&tip.block).to_string(),
     }))
+}
+
+#[derive(Serialize)]
+struct StatusResponse {
+    network: String,
+    // chain (proof-verified)
+    height: u32,
+    state_hash: String,
+    epoch: u32,
+    global_slot: u32,
+    /// Ouroboros chain-quality / censorship-resistance signal (lower = unhealthier).
+    min_window_density: u32,
+    staking_epoch_ledger_hash: String,
+    // node / monitor
+    verified: u64,
+    rejected: u64,
+    reorgs: u64,
+    forks: u64,
+    uptime_secs: u64,
+    /// Sync freshness; `null` until the first verified tip.
+    seconds_since_last_verified: Option<u64>,
+}
+
+/// Rich health + chain-quality view — the integrity monitor's read model.
+async fn status(State(state): State<Arc<AppState>>) -> Result<Json<StatusResponse>, ApiError> {
+    let tip = state
+        .tip
+        .read()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "no verified tip yet"))?;
+    let cs = &tip.block.header.protocol_state.body.consensus_state;
+    let last = state.last_verified_unix.load(Ordering::Relaxed);
+    Ok(Json(StatusResponse {
+        network: state.network.clone(),
+        height: tip.height,
+        state_hash: tip.state_hash.clone(),
+        epoch: cs.epoch_count.as_u32(),
+        global_slot: cs.global_slot_since_genesis.as_u32(),
+        min_window_density: cs.min_window_density.as_u32(),
+        staking_epoch_ledger_hash: staking_epoch_ledger_hash(&tip.block).to_string(),
+        verified: state.verified.load(Ordering::Relaxed),
+        rejected: state.rejected.load(Ordering::Relaxed),
+        reorgs: state.reorgs.load(Ordering::Relaxed),
+        forks: state.forks.load(Ordering::Relaxed),
+        uptime_secs: state.started.elapsed().as_secs(),
+        seconds_since_last_verified: (last != 0).then(|| now_unix().saturating_sub(last)),
+    }))
+}
+
+/// Prometheus exposition — the integrity monitor scrapes this (alert on tip staleness,
+/// reorg depth, low density, rejected blocks, etc.).
+async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    use std::fmt::Write;
+    fn m(out: &mut String, name: &str, typ: &str, help: &str, val: u64) {
+        let _ = writeln!(
+            out,
+            "# HELP {name} {help}\n# TYPE {name} {typ}\n{name} {val}"
+        );
+    }
+
+    let mut s = String::new();
+    m(
+        &mut s,
+        "mina_light_node_up",
+        "gauge",
+        "1 if the node is serving",
+        1,
+    );
+    m(
+        &mut s,
+        "mina_light_node_uptime_seconds",
+        "gauge",
+        "process uptime",
+        state.started.elapsed().as_secs(),
+    );
+    m(
+        &mut s,
+        "mina_light_node_verified_total",
+        "counter",
+        "blocks whose proof verified",
+        state.verified.load(Ordering::Relaxed),
+    );
+    m(
+        &mut s,
+        "mina_light_node_rejected_total",
+        "counter",
+        "blocks rejected (invalid proof)",
+        state.rejected.load(Ordering::Relaxed),
+    );
+    m(
+        &mut s,
+        "mina_light_node_reorgs_total",
+        "counter",
+        "reorgs adopted",
+        state.reorgs.load(Ordering::Relaxed),
+    );
+    m(
+        &mut s,
+        "mina_light_node_forks_total",
+        "counter",
+        "competing forks seen",
+        state.forks.load(Ordering::Relaxed),
+    );
+
+    let last = state.last_verified_unix.load(Ordering::Relaxed);
+    if last != 0 {
+        m(
+            &mut s,
+            "mina_light_node_seconds_since_last_verified",
+            "gauge",
+            "sync freshness",
+            now_unix().saturating_sub(last),
+        );
+    }
+    if let Some(tip) = state.tip.read().unwrap().as_ref() {
+        let cs = &tip.block.header.protocol_state.body.consensus_state;
+        m(
+            &mut s,
+            "mina_light_node_tip_height",
+            "gauge",
+            "verified best tip height",
+            tip.height as u64,
+        );
+        m(
+            &mut s,
+            "mina_light_node_epoch",
+            "gauge",
+            "current epoch",
+            cs.epoch_count.as_u32() as u64,
+        );
+        m(
+            &mut s,
+            "mina_light_node_global_slot",
+            "gauge",
+            "global slot since genesis",
+            cs.global_slot_since_genesis.as_u32() as u64,
+        );
+        m(
+            &mut s,
+            "mina_light_node_min_window_density",
+            "gauge",
+            "Ouroboros min-window density",
+            cs.min_window_density.as_u32() as u64,
+        );
+    }
+
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        s,
+    )
 }
 
 #[derive(Deserialize)]

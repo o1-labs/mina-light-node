@@ -13,6 +13,8 @@ consumer), this is a real light *node*: it participates in the network.
   proof validates the whole chain (stronger than Bitcoin SPV: no header download).
 - **Liveness / censorship-resistance** ("you see the *real, current* chain") comes
   from `mina-relay` — decentralized p2p access across many peers, not a trusted RPC.
+  It bootstraps from the seeds, then **discovers the wider network via Kademlia**
+  (Mina's `/coda/kad/1.0.0`), reaching ~20+ peers instead of ~2 (eclipse resistance).
 
 ## Crates
 

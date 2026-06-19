@@ -11,8 +11,33 @@ mod transport;
 use std::ops::ControlFlow;
 use std::time::Duration;
 
-use libp2p::{futures::StreamExt, gossipsub, swarm::SwarmEvent, Multiaddr};
+use libp2p::kad::{self, store::MemoryStore};
+use libp2p::swarm::NetworkBehaviour;
+use libp2p::{
+    futures::StreamExt, gossipsub, multiaddr::Protocol, swarm::SwarmEvent, Multiaddr, PeerId,
+    StreamProtocol,
+};
 use transport::ed25519::{Keypair as EdKeypair, SecretKey};
+
+/// Mina's DHT protocol — prefix `/coda` (the daemon sets `dht.ProtocolPrefix("/coda")`),
+/// so peers answer Kademlia queries on `/coda/kad/1.0.0`. Used to discover peers beyond
+/// the seeds (eclipse / censorship resistance) — the seeds are only bootstrap nodes.
+const KAD_PROTOCOL: StreamProtocol = StreamProtocol::new("/coda/kad/1.0.0");
+
+/// gossip (blocks + pool diffs) + Kademlia peer discovery, on one swarm.
+#[derive(NetworkBehaviour)]
+struct NodeBehaviour {
+    gossipsub: gossipsub::Behaviour,
+    kad: kad::Behaviour<MemoryStore>,
+}
+
+/// The `/p2p/<peer-id>` component of a multiaddr, if present.
+fn peer_id_of(addr: &Multiaddr) -> Option<PeerId> {
+    addr.iter().find_map(|p| match p {
+        Protocol::P2p(id) => Some(id),
+        _ => None,
+    })
+}
 
 /// Live devnet chain id (matches `daemonStatus.chainId`).
 pub const DEVNET_CHAIN_ID: &str =
@@ -140,9 +165,10 @@ pub async fn subscribe_gossip<F, T>(
         .collect();
 
     let local_key: libp2p::identity::Keypair = EdKeypair::from(SecretKey::generate()).into();
-    log::info!("local peer id: {}", local_key.public().to_peer_id());
+    let local_peer_id = local_key.public().to_peer_id();
+    log::info!("local peer id: {local_peer_id}");
 
-    let behaviour: gossipsub::Behaviour = {
+    let gossipsub: gossipsub::Behaviour = {
         let cfg = gossipsub::ConfigBuilder::default()
             .max_transmit_size(1024 * 1024 * 32)
             .build()
@@ -153,6 +179,23 @@ pub async fn subscribe_gossip<F, T>(
         )
         .expect("gossipsub behaviour")
     };
+
+    // Kademlia, on Mina's `/coda/kad/1.0.0`, seeded from the bootstrap peers — so we
+    // discover the wider network instead of sitting on just the 2-3 seeds.
+    let kad: kad::Behaviour<MemoryStore> = {
+        let mut cfg = kad::Config::default();
+        cfg.set_protocol_names(vec![KAD_PROTOCOL]);
+        let mut k =
+            kad::Behaviour::with_config(local_peer_id, MemoryStore::new(local_peer_id), cfg);
+        for addr in &peers {
+            if let Some(pid) = peer_id_of(addr) {
+                k.add_address(&pid, addr.clone());
+            }
+        }
+        k
+    };
+
+    let behaviour = NodeBehaviour { gossipsub, kad };
 
     // pnet PSK = Blake2b256("/coda/0.0.1/" || chain_id); transport::swarm hashes the
     // bytes we pass with no prefix, so prepend it here.
@@ -166,14 +209,14 @@ pub async fn subscribe_gossip<F, T>(
     );
 
     let topic = gossipsub::IdentTopic::new(CONSENSUS_TOPIC);
-    swarm.behaviour_mut().subscribe(&topic).unwrap();
+    swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
     for peer in &peers {
-        for proto in peer.iter() {
-            if let libp2p::multiaddr::Protocol::P2p(peer_id) = proto {
-                swarm.behaviour_mut().add_explicit_peer(&peer_id);
-            }
+        if let Some(peer_id) = peer_id_of(peer) {
+            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
         }
     }
+    // Kick off discovery: fill the routing table from the seeds, then expand it.
+    let _ = swarm.behaviour_mut().kad.bootstrap();
 
     let sleep = async {
         match deadline {
@@ -183,6 +226,9 @@ pub async fn subscribe_gossip<F, T>(
     };
     tokio::pin!(sleep);
     let mut tick = tokio::time::interval(Duration::from_secs(2));
+    // Periodically probe the DHT for new peers (a query for a random key walks the
+    // network and surfaces fresh routing entries we then dial).
+    let mut discover = tokio::time::interval(Duration::from_secs(30));
     let mut connected = std::collections::HashSet::new();
 
     loop {
@@ -192,12 +238,27 @@ pub async fn subscribe_gossip<F, T>(
                 // periodic wake — emit a heartbeat (with the live peer count) / cancel while idle.
                 if let ControlFlow::Break(()) = on_tick(connected.len()) { break; }
             }
+            _ = discover.tick() => {
+                log::info!("peers connected: {} (kad discovery)", connected.len());
+                let _ = swarm.behaviour_mut().kad.get_closest_peers(PeerId::random());
+            }
             ev = swarm.next() => match ev {
-                Some(SwarmEvent::Behaviour(gossipsub::Event::Message { message, .. })) => {
+                Some(SwarmEvent::Behaviour(NodeBehaviourEvent::Gossipsub(
+                    gossipsub::Event::Message { message, .. },
+                ))) => {
                     // Every gossip message (block / snark-pool / tx-pool diff); the
                     // caller discriminates on data[8] (0=block, 1=snark, 2=tx-pool).
                     if let ControlFlow::Break(()) = on_msg(&message.data) {
                         break;
+                    }
+                }
+                Some(SwarmEvent::Behaviour(NodeBehaviourEvent::Kad(
+                    kad::Event::RoutingUpdated { peer, .. },
+                ))) => {
+                    // Discovered a peer — dial it to join the gossip mesh (kad supplies
+                    // its addresses). More peers ⇒ better liveness / eclipse resistance.
+                    if !connected.contains(&peer) {
+                        let _ = swarm.dial(peer);
                     }
                 }
                 Some(SwarmEvent::ConnectionEstablished { peer_id, .. }) => {

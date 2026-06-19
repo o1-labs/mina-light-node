@@ -29,17 +29,15 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use mina_light_node::{index_map, sweep_index_map};
 use mina_p2p_messages::binprot::BinProtRead;
-use mina_p2p_messages::v2::{
-    LedgerHash, MinaBaseUserCommandStableV2, MinaLedgerSyncLedgerAnswerStableV2,
-    MinaLedgerSyncLedgerQueryStableV1,
-};
+use mina_p2p_messages::v2::MinaBaseUserCommandStableV2;
 use mina_relay::broadcast::broadcast_tx;
 use mina_relay::mempool::MempoolView;
 use mina_relay::{network_seeds, rpc_net, subscribe_gossip};
 use mina_verify::{
-    block_from_gossip_payload, ledger_sweep_queries, pubkey_index_pairs, staking_epoch_ledger_hash,
-    sync_ledger_queries, verify_account_at_root, Block, Verifier, LEDGER_DEPTH,
+    block_from_gossip_payload, staking_epoch_ledger_hash, sync_ledger_queries,
+    verify_account_at_root, Block, Verifier, LEDGER_DEPTH,
 };
 use serde::{Deserialize, Serialize};
 
@@ -51,13 +49,14 @@ struct TipInfo {
     state_hash: String,
 }
 
-/// A public-key → leaf-index map. Mina indices are permanent + append-only, so this is
-/// monotonic across ledgers: built once, then only the appended tail is re-swept.
-/// `covered` is the number of leaves already mapped. The map is an untrusted hint —
-/// `/account` re-proves every read against the verified root.
+/// A `addr-hash → leaf-index` map (keyed by [`index_map::addr_key`]). Mina indices are
+/// permanent + append-only, so this is monotonic across ledgers: loaded from a baked
+/// `.bin` and/or built by sweeping, then only the appended tail is re-swept. `covered`
+/// is the number of leaves already mapped. An untrusted hint — `/account` re-proves
+/// every read against the verified root.
 struct IndexCache {
     covered: u64,
-    map: HashMap<String, u64>,
+    map: HashMap<[u8; 16], u64>,
 }
 
 struct AppState {
@@ -104,6 +103,29 @@ async fn main() {
         rejected: AtomicU64::new(0),
         last_verified_unix: AtomicU64::new(0),
     });
+
+    // Baked map: if LIGHT_NODE_INDEX_MAP points at a .bin (built by `mapgen`), load it so
+    // `/account?pubkey=` works immediately — no cold-start sweep. The background sweep
+    // then only fills the appended tail.
+    if let Ok(path) = std::env::var("LIGHT_NODE_INDEX_MAP") {
+        match std::fs::read(&path) {
+            // An empty/placeholder file = no baked map (the image ships one so the COPY
+            // always succeeds); fall through to sweeping.
+            Ok(blob) if blob.len() < 8 => {
+                log::info!("LIGHT_NODE_INDEX_MAP {path} is empty; will sweep instead")
+            }
+            Ok(blob) => {
+                let covered = index_map::covered(&blob);
+                let map: HashMap<[u8; 16], u64> = index_map::load(&blob).into_iter().collect();
+                eprintln!(
+                    "loaded baked index map {path}: {} keys, covered {covered}",
+                    map.len()
+                );
+                *state.index.write().unwrap() = Some(IndexCache { covered, map });
+            }
+            Err(e) => log::warn!("LIGHT_NODE_INDEX_MAP {path}: {e}; will sweep instead"),
+        }
+    }
 
     // Verify-before-tip worker thread (multi-second crypto, off the async runtime).
     let (block_tx, block_rx) = mpsc::channel::<Vec<u8>>();
@@ -196,7 +218,7 @@ async fn main() {
                         .as_ref()
                         .map(|c| c.covered)
                         .unwrap_or(0);
-                    match sweep_tail(state.chain_id, state.peers, root, covered).await {
+                    match sweep_index_map(state.chain_id, state.peers, root, covered).await {
                         Ok((num, pairs)) if num > covered => {
                             let mut guard = state.index.write().unwrap();
                             let cache = guard.get_or_insert_with(|| IndexCache {
@@ -204,7 +226,7 @@ async fn main() {
                                 map: HashMap::new(),
                             });
                             for (pk, idx) in pairs {
-                                cache.map.insert(pk, idx);
+                                cache.map.insert(index_map::addr_key(&pk), idx);
                             }
                             cache.covered = num;
                             log::info!(
@@ -233,69 +255,6 @@ async fn main() {
     eprintln!("mina-light-node-server on http://{addr} ({network}) — trustless reads + submit");
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
     axum::serve(listener, app).await.expect("serve");
-}
-
-/// Sweep the leaves at indices `[covered, num)` of the epoch ledger and return
-/// `(num, (pubkey, index) pairs)`. `NumAccounts` sizes it; then the tail is swept in
-/// **chunks over fresh connections** — a single connection drops (`unexpected end of
-/// file`) partway through a many-thousand-query walk, so each chunk gets its own
-/// connection and is retried on drop. The map is an untrusted hint — every `/account`
-/// read re-proves inclusion against the verified root.
-async fn sweep_tail(
-    chain_id: &'static str,
-    peers: &'static [&'static str],
-    root: LedgerHash,
-    covered: u64,
-) -> Result<(u64, Vec<(String, u64)>), String> {
-    let na = rpc_net::fetch_sync_ledger_answers(
-        chain_id,
-        peers,
-        root.clone(),
-        &[MinaLedgerSyncLedgerQueryStableV1::NumAccounts],
-        Duration::from_secs(60),
-    )
-    .await?;
-    let num = match na.into_iter().next() {
-        Some(MinaLedgerSyncLedgerAnswerStableV2::NumAccounts(n, _)) => n.0,
-        other => return Err(format!("expected NumAccounts, got {other:?}")),
-    };
-    if num <= covered {
-        return Ok((num, Vec::new()));
-    }
-
-    // Sweep subtree-aligned chunks; ~8k accounts per connection keeps each walk short
-    // enough to complete before the peer drops the stream. A dropped chunk is retried.
-    const CHUNK: u64 = 256 * 32; // ≈8k accounts (≈256 What_contents queries) per connection
-    let mut pairs = Vec::new();
-    let mut start = mina_verify::sweep_base_index(covered);
-    while start < num {
-        let end = (start + CHUNK).min(num);
-        let queries = ledger_sweep_queries(start, end, LEDGER_DEPTH);
-        let mut attempt = 0;
-        let answers = loop {
-            match rpc_net::fetch_sync_ledger_answers(
-                chain_id,
-                peers,
-                root.clone(),
-                &queries,
-                Duration::from_secs(120),
-            )
-            .await
-            {
-                Ok(a) => break a,
-                Err(e) if attempt < 5 => {
-                    attempt += 1;
-                    log::debug!("sweep chunk {start}..{end} retry {attempt}: {e}");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-                Err(e) => return Err(format!("sweep chunk {start}..{end} failed: {e}")),
-            }
-        };
-        pairs.extend(pubkey_index_pairs(&answers, start, LEDGER_DEPTH).map_err(|e| e.to_string())?);
-        log::info!("epoch-ledger sweep: {end}/{num} accounts mapped");
-        start = end;
-    }
-    Ok((num, pairs))
 }
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
@@ -382,7 +341,7 @@ async fn account(
         (None, Some(pk)) => {
             let cache = state.index.read().unwrap();
             match cache.as_ref() {
-                Some(c) => *c.map.get(pk).ok_or_else(|| {
+                Some(c) => *c.map.get(&index_map::addr_key(pk)).ok_or_else(|| {
                     err(
                         StatusCode::NOT_FOUND,
                         format!("{pk} not in the epoch ledger"),

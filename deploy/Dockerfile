@@ -21,6 +21,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/mina-light-node /usr/local/bin/mina-light-node
 COPY --from=build /src/target/release/mina-light-node-server /usr/local/bin/mina-light-node-server
+# Baked pubkey→index map: the release pipeline replaces deploy/index_map.bin (an empty
+# placeholder in-tree) with the real map for this network, so `/account?pubkey=` resolves
+# without a cold-start sweep. Empty placeholder ⇒ the server just sweeps at runtime.
+COPY deploy/index_map.bin /opt/index_map.bin
+ENV LIGHT_NODE_INDEX_MAP=/opt/index_map.bin
 # The network is baked at BUILD time, so the container is truly configureless —
 # `docker run` needs no env, no flags. One image == one network:
 #   docker build -t mina-light-node:devnet  .                               # devnet (default)

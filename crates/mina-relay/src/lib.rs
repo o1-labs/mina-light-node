@@ -14,10 +14,13 @@ use std::time::Duration;
 use libp2p::kad::{self, store::MemoryStore};
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{
-    futures::StreamExt, gossipsub, multiaddr::Protocol, swarm::SwarmEvent, Multiaddr, PeerId,
+    futures::StreamExt, gossipsub, multiaddr::Protocol, swarm::SwarmEvent, Multiaddr,
     StreamProtocol,
 };
 use transport::ed25519::{Keypair as EdKeypair, SecretKey};
+
+/// Peer identity (re-exported so consumers can name it without depending on libp2p).
+pub use libp2p::PeerId;
 
 /// Mina's DHT protocol — prefix `/coda` (the daemon sets `dht.ProtocolPrefix("/coda")`),
 /// so peers answer Kademlia queries on `/coda/kad/1.0.0`. Used to discover peers beyond
@@ -126,11 +129,14 @@ pub async fn subscribe_blocks<F, T>(
     F: FnMut(&[u8]) -> ControlFlow<()>,
     T: FnMut(usize) -> ControlFlow<()>,
 {
+    // The headless block path doesn't ban peers; hold the sender so the receiver never
+    // fires (and isn't seen as closed).
+    let (_ban_tx, ban_rx) = tokio::sync::mpsc::unbounded_channel();
     subscribe_gossip(
         chain_id,
         peers,
         deadline,
-        |data| {
+        |_src, data| {
             if is_new_state_payload(data) {
                 on_block(data)
             } else {
@@ -138,6 +144,7 @@ pub async fn subscribe_blocks<F, T>(
             }
         },
         on_tick,
+        ban_rx,
     )
     .await
 }
@@ -149,14 +156,19 @@ pub async fn subscribe_blocks<F, T>(
 /// [`crate::mempool::tx_pool_diff_from_gossip`] for pending transactions).
 ///
 /// Runs until `on_msg` returns [`ControlFlow::Break`] or `deadline` elapses.
+/// `on_msg` receives the gossip **propagation source** (the peer that relayed the
+/// message to us) and the raw payload. Peers sent on `ban_rx` are disconnected and
+/// blocklisted — the caller uses this to evict peers that relay invalid-proof blocks
+/// (reactive verification). Pass a never-firing receiver (hold its sender) to disable.
 pub async fn subscribe_gossip<F, T>(
     chain_id: &str,
     peers: &[&str],
     deadline: Option<Duration>,
     mut on_msg: F,
     mut on_tick: T,
+    mut ban_rx: tokio::sync::mpsc::UnboundedReceiver<PeerId>,
 ) where
-    F: FnMut(&[u8]) -> ControlFlow<()>,
+    F: FnMut(PeerId, &[u8]) -> ControlFlow<()>,
     T: FnMut(usize) -> ControlFlow<()>,
 {
     let peers: Vec<Multiaddr> = peers
@@ -230,6 +242,8 @@ pub async fn subscribe_gossip<F, T>(
     // network and surfaces fresh routing entries we then dial).
     let mut discover = tokio::time::interval(Duration::from_secs(30));
     let mut connected = std::collections::HashSet::new();
+    // Peers evicted for relaying invalid-proof blocks — never re-dialed/re-accepted.
+    let mut banned: std::collections::HashSet<PeerId> = std::collections::HashSet::new();
 
     loop {
         tokio::select! {
@@ -242,13 +256,23 @@ pub async fn subscribe_gossip<F, T>(
                 log::info!("peers connected: {} (kad discovery)", connected.len());
                 let _ = swarm.behaviour_mut().kad.get_closest_peers(PeerId::random());
             }
+            maybe_ban = ban_rx.recv() => {
+                if let Some(peer) = maybe_ban {
+                    if banned.insert(peer) {
+                        log::warn!("banning {peer} (relayed invalid-proof block)");
+                        let _ = swarm.disconnect_peer_id(peer);
+                        swarm.behaviour_mut().kad.remove_peer(&peer);
+                    }
+                }
+            }
             ev = swarm.next() => match ev {
                 Some(SwarmEvent::Behaviour(NodeBehaviourEvent::Gossipsub(
-                    gossipsub::Event::Message { message, .. },
+                    gossipsub::Event::Message { propagation_source, message, .. },
                 ))) => {
                     // Every gossip message (block / snark-pool / tx-pool diff); the
-                    // caller discriminates on data[8] (0=block, 1=snark, 2=tx-pool).
-                    if let ControlFlow::Break(()) = on_msg(&message.data) {
+                    // caller discriminates on data[8] (0=block, 1=snark, 2=tx-pool) and
+                    // gets `propagation_source` so it can ban a peer that relays junk.
+                    if let ControlFlow::Break(()) = on_msg(propagation_source, &message.data) {
                         break;
                     }
                 }
@@ -257,12 +281,17 @@ pub async fn subscribe_gossip<F, T>(
                 ))) => {
                     // Discovered a peer — dial it to join the gossip mesh (kad supplies
                     // its addresses). More peers ⇒ better liveness / eclipse resistance.
-                    if !connected.contains(&peer) {
+                    if !connected.contains(&peer) && !banned.contains(&peer) {
                         let _ = swarm.dial(peer);
                     }
                 }
                 Some(SwarmEvent::ConnectionEstablished { peer_id, .. }) => {
-                    connected.insert(peer_id);
+                    // Enforce the ban even if something re-dialed a blocklisted peer.
+                    if banned.contains(&peer_id) {
+                        let _ = swarm.disconnect_peer_id(peer_id);
+                    } else {
+                        connected.insert(peer_id);
+                    }
                 }
                 Some(SwarmEvent::ConnectionClosed { peer_id, .. }) => {
                     connected.remove(&peer_id);

@@ -79,6 +79,12 @@ Cross-check your Rosetta/RPC tip against `/tip` (and balances against `/account`
 stale or lying provider. If the verifier can't be built the process exits non-zero (it never
 runs "healthy" while verifying nothing).
 
+**Reactive verification.** A peer that relays invalid-proof blocks is disconnected and
+blocklisted after a few strikes (`mina_light_node_banned_total`); the node never adopts an
+unverified tip regardless. With Kademlia discovery keeping `mina_light_node_peers` high
+(~20+), banning a bad peer is safe — there are plenty of honest ones to fall back on. Alert
+on `mina_light_node_peers` low (eclipse risk) and `mina_light_node_banned_total` rising.
+
 ### Baked `pubkey → index` map
 
 By-public-key needs a `pubkey → leaf-index` map (the sync-ledger RPC indexes by leaf, not

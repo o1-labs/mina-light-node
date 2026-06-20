@@ -18,6 +18,13 @@
 //! Env: MINA_NETWORK (devnet|mainnet), LIGHT_NODE_HTTP_ADDR (default 127.0.0.1:8645),
 //!      MINA_VK_JSON (optional, for networks without an embedded VK).
 
+// jemalloc returns freed memory to the OS far better than glibc malloc, whose per-thread
+// arenas retain the verifier's large transient allocations and ratchet RSS to a high
+// plateau (see workspace Cargo.toml).
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
@@ -154,7 +161,14 @@ async fn main() {
 
     // Verify-before-tip worker thread (multi-second crypto, off the async runtime). Each
     // block carries the peer that relayed it, so the worker can ban repeat offenders.
-    let (block_tx, block_rx) = mpsc::channel::<(PeerId, Vec<u8>)>();
+    //
+    // BOUNDED queue: block verification (seconds) is slower than gossip ingest, and block
+    // payloads are large. An unbounded channel would let a gossip burst grow without limit
+    // until OOM. We cap the backlog and drop newest-on-full — gossip re-delivers blocks, so
+    // a dropped one re-arrives once the worker drains, and the canonical tip is still
+    // verified within a slot. `BLOCK_QUEUE` covers a healthy fork set per slot with margin.
+    const BLOCK_QUEUE: usize = 256;
+    let (block_tx, block_rx) = mpsc::sync_channel::<(PeerId, Vec<u8>)>(BLOCK_QUEUE);
     // Reactive verification: the worker asks the gossip loop to disconnect+blocklist a
     // peer once it relays too many invalid-proof blocks.
     let (ban_tx, ban_rx) = tokio::sync::mpsc::unbounded_channel::<PeerId>();
@@ -255,7 +269,13 @@ async fn main() {
                 |src, payload| {
                     match payload.get(8) {
                         Some(0) => {
-                            let _ = block_tx.send((src, payload.to_vec()));
+                            // Non-blocking: never stall the gossip/async runtime on a full
+                            // queue. Drop-newest on backlog — gossip re-delivers the block.
+                            if let Err(mpsc::TrySendError::Full(_)) =
+                                block_tx.try_send((src, payload.to_vec()))
+                            {
+                                log::warn!("verify queue full ({BLOCK_QUEUE}); dropped a block (gossip will re-deliver)");
+                            }
                         }
                         Some(2) => {
                             state.mempool.lock().unwrap().ingest_gossip(payload);

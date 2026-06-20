@@ -31,3 +31,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
 blake2 = { workspace = true }
+
+# jemalloc as the global allocator (see workspace Cargo.toml for why) — wired in the
+# long-running binaries (server + headless node), not the short-lived mapgen tool.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true }

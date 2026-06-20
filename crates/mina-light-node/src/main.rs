@@ -16,6 +16,13 @@
 //! (in seconds) for tests/CI; unset = run forever, the out-of-the-box default.
 //! Set `RUST_LOG=info` for libp2p logs.
 
+// jemalloc returns freed memory to the OS far better than glibc malloc, whose per-thread
+// arenas retain the verifier's large transient allocations and ratchet RSS to a high
+// plateau (see workspace Cargo.toml).
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::ops::ControlFlow;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -42,8 +49,14 @@ async fn main() {
     );
 
     // Worker thread: verify-before-ingest, off the gossip event loop.
+    //
+    // BOUNDED queue: verification (seconds) is slower than gossip ingest and block payloads
+    // are large, so an unbounded channel would let a gossip burst grow until OOM. Cap the
+    // backlog and drop-newest on full — gossip re-delivers, so a dropped block re-arrives
+    // once the worker drains.
+    const BLOCK_QUEUE: usize = 256;
     let net = network.clone();
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(BLOCK_QUEUE);
     let worker = std::thread::spawn(move || {
         let verifier = Verifier::for_network(&net).expect("verifier for network");
         let mut monitor = ChainMonitor::new(512);
@@ -92,8 +105,13 @@ async fn main() {
         peers,
         deadline,
         |payload| {
-            // Hand off instantly; verification happens on the worker thread.
-            let _ = tx.send(payload.to_vec());
+            // Hand off instantly; verification happens on the worker thread. Non-blocking
+            // so a full queue never stalls the gossip loop — drop-newest, gossip re-delivers.
+            if let Err(mpsc::TrySendError::Full(_)) = tx.try_send(payload.to_vec()) {
+                log::warn!(
+                    "verify queue full ({BLOCK_QUEUE}); dropped a block (gossip will re-deliver)"
+                );
+            }
             ControlFlow::Continue(())
         },
         |_| ControlFlow::Continue(()),

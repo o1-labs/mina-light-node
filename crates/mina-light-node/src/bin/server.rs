@@ -25,7 +25,7 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,22 +39,40 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use mina_light_node::{index_map, sweep_index_map};
 use mina_p2p_messages::binprot::BinProtRead;
-use mina_p2p_messages::v2::MinaBaseUserCommandStableV2;
+use mina_p2p_messages::v2::{LedgerHash, MinaBaseUserCommandStableV2};
 use mina_relay::broadcast::broadcast_tx;
 use mina_relay::mempool::MempoolView;
 use mina_relay::{network_seeds, rpc_net, subscribe_gossip, PeerId};
 use mina_verify::{
-    block_from_gossip_payload, staking_epoch_ledger_hash, sync_ledger_queries,
-    verify_account_at_root, Block, ChainMonitor, Ingest, Verifier, LEDGER_DEPTH,
+    block_from_gossip_payload, header_from_precomputed, sync_ledger_queries,
+    verify_account_at_root, BlockHeader, ChainMonitor, Ingest, Verifier, LEDGER_DEPTH,
 };
 use serde::{Deserialize, Serialize};
 
 /// The latest proof-verified tip and the data derived from it.
 #[derive(Clone)]
 struct TipInfo {
-    block: Block,
+    /// The verified block **header** — enough for every read we serve (`/status`
+    /// consensus fields, `/account` epoch-ledger root). Header-only so the gossip and
+    /// precomputed-block tip sources produce the same shape (`header_from_precomputed`
+    /// yields a header, not a full block).
+    header: BlockHeader,
     height: u32,
     state_hash: String,
+}
+
+/// The **staking epoch** ledger root from a verified header's consensus state — the
+/// header-based twin of [`mina_verify::staking_epoch_ledger_hash`] (which needs a full
+/// block). Proven field; the ledger live peers actually serve over the sync-ledger RPC.
+fn staking_epoch_ledger_hash_h(header: &BlockHeader) -> LedgerHash {
+    header
+        .protocol_state
+        .body
+        .consensus_state
+        .staking_epoch_data
+        .ledger
+        .hash
+        .clone()
 }
 
 /// A `addr-hash → leaf-index` map (keyed by [`index_map::addr_key`]). Mina indices are
@@ -108,6 +126,88 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Adopt `info` as the tip if it's strictly newer than the current one. Used by the
+/// precomputed-block source (the gossip worker adopts via fork-choice instead).
+fn adopt_tip(state: &Arc<AppState>, info: TipInfo) {
+    let mut tip = state.tip.write().unwrap();
+    if tip.as_ref().map(|t| info.height > t.height).unwrap_or(true) {
+        log::info!("verified tip h{}", info.height);
+        *tip = Some(info);
+    }
+}
+
+/// The highest-numbered precomputed block in `dir`, as `(height, state_hash, path)`.
+/// Files are named `<net>-<height>-<state_hash>.json` (the indexer's layout). The net
+/// prefix may itself contain '-' (e.g. `mesa-mut`), so parse from the right: the state
+/// hash is the last '-' segment and the height the one before it.
+fn latest_precomputed(dir: &str, skip: &HashSet<u32>) -> Option<(u32, String, std::path::PathBuf)> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let path = e.path();
+            let stem = path.file_name()?.to_str()?.strip_suffix(".json")?;
+            let (rest, state_hash) = stem.rsplit_once('-')?;
+            let (_net, height) = rest.rsplit_once('-')?;
+            let height: u32 = height.parse().ok()?;
+            (!skip.contains(&height)).then_some((height, state_hash.to_string(), path))
+        })
+        .max_by_key(|(h, _, _)| *h)
+}
+
+/// Poll the indexer's precomputed-block dir; verify each new tip's header proof (the
+/// trust gate) and adopt it. Reuses the indexer's already-downloaded blocks — no p2p
+/// block bootstrap. The staged-ledger diff is ignored; only the proof-bearing header is
+/// read (`header_from_precomputed`), so a header is all we adopt (see [`TipInfo`]).
+fn precomputed_block_loop(verifier: &Verifier, state: &Arc<AppState>, dir: &str) {
+    log::info!("tip source: precomputed blocks in {dir} (verify-before-adopt)");
+    let mut last = 0u32;
+    loop {
+        // Adopt the highest *usable* block each cycle, skipping any that fail to read,
+        // decode, or verify — so one bad top file (partial write, corrupt encoding) can't
+        // wedge tip adoption; we fall back to the highest good block below it. `skip`
+        // resets per cycle so a transiently-bad file (mid-write) is retried next time.
+        let mut skip: HashSet<u32> = HashSet::new();
+        while let Some((height, state_hash, path)) = latest_precomputed(dir, &skip) {
+            if height <= last {
+                break;
+            }
+            match std::fs::read_to_string(&path).map(|j| header_from_precomputed(&j)) {
+                Ok(Ok(header)) if verifier.verify_header(&header) => {
+                    state.verified.fetch_add(1, Ordering::Relaxed);
+                    state
+                        .last_verified_unix
+                        .store(now_unix(), Ordering::Relaxed);
+                    let cs = &header.protocol_state.body.consensus_state;
+                    adopt_tip(
+                        state,
+                        TipInfo {
+                            height: cs.blockchain_length.as_u32(),
+                            state_hash,
+                            header,
+                        },
+                    );
+                    last = height;
+                }
+                Ok(Ok(_)) => {
+                    state.rejected.fetch_add(1, Ordering::Relaxed);
+                    log::warn!("precomputed block h{height} failed proof verification — skipped");
+                    skip.insert(height);
+                }
+                Ok(Err(e)) => {
+                    log::warn!("decode precomputed block h{height}: {e}");
+                    skip.insert(height);
+                }
+                Err(e) => {
+                    log::warn!("read precomputed block h{height}: {e}");
+                    skip.insert(height);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_secs(15));
+    }
+}
+
 #[tokio::main]
 async fn main() {
     env_logger::init();
@@ -157,6 +257,28 @@ async fn main() {
             }
             Err(e) => log::warn!("LIGHT_NODE_INDEX_MAP {path}: {e}; will sweep instead"),
         }
+    }
+
+    // Tip source. Two modes, both gated by the same proof trust check:
+    //   - LIGHT_NODE_BLOCKS_DIR set: poll the indexer's precomputed-block dir (reuse its
+    //     already-downloaded data — no p2p block bootstrap). Robust where gossip is
+    //     unreliable (e.g. mesa-mut). The gossip task then taps the mempool only.
+    //   - else: the p2p gossip block stream (verified by the worker thread below).
+    let blocks_dir = std::env::var("LIGHT_NODE_BLOCKS_DIR").ok();
+    let use_gossip_blocks = blocks_dir.is_none();
+    if let Some(dir) = blocks_dir {
+        let net = network.clone();
+        let state = state.clone();
+        std::thread::spawn(move || {
+            let verifier = match build_verifier(&net) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::error!("fatal: cannot build verifier for {net:?}: {e}");
+                    std::process::exit(1);
+                }
+            };
+            precomputed_block_loop(&verifier, &state, &dir);
+        });
     }
 
     // Verify-before-tip worker thread (multi-second crypto, off the async runtime). Each
@@ -237,7 +359,7 @@ async fn main() {
                             log::info!("verified tip h{height}");
                             *state.tip.write().unwrap() = Some(TipInfo {
                                 state_hash: t.state_hash().to_string(),
-                                block: t.block().clone(),
+                                header: t.block().header.clone(),
                                 height,
                             });
                         }
@@ -268,7 +390,7 @@ async fn main() {
                 None,
                 |src, payload| {
                     match payload.get(8) {
-                        Some(0) => {
+                        Some(0) if use_gossip_blocks => {
                             // Non-blocking: never stall the gossip/async runtime on a full
                             // queue. Drop-newest on backlog — gossip re-delivers the block.
                             if let Err(mpsc::TrySendError::Full(_)) =
@@ -303,7 +425,7 @@ async fn main() {
             loop {
                 let tip = state.tip.read().unwrap().clone();
                 if let Some(tip) = tip {
-                    let root = staking_epoch_ledger_hash(&tip.block);
+                    let root = staking_epoch_ledger_hash_h(&tip.header);
                     let covered = state
                         .index
                         .read()
@@ -390,7 +512,7 @@ async fn tip(State(state): State<Arc<AppState>>) -> Result<Json<TipResponse>, Ap
         network: state.network.clone(),
         height: tip.height,
         state_hash: tip.state_hash,
-        staking_epoch_ledger_hash: staking_epoch_ledger_hash(&tip.block).to_string(),
+        staking_epoch_ledger_hash: staking_epoch_ledger_hash_h(&tip.header).to_string(),
     }))
 }
 
@@ -425,7 +547,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<StatusRespons
         .unwrap()
         .clone()
         .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "no verified tip yet"))?;
-    let cs = &tip.block.header.protocol_state.body.consensus_state;
+    let cs = &tip.header.protocol_state.body.consensus_state;
     let last = state.last_verified_unix.load(Ordering::Relaxed);
     Ok(Json(StatusResponse {
         network: state.network.clone(),
@@ -434,7 +556,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<StatusRespons
         epoch: cs.epoch_count.as_u32(),
         global_slot: cs.global_slot_since_genesis.as_u32(),
         min_window_density: cs.min_window_density.as_u32(),
-        staking_epoch_ledger_hash: staking_epoch_ledger_hash(&tip.block).to_string(),
+        staking_epoch_ledger_hash: staking_epoch_ledger_hash_h(&tip.header).to_string(),
         peers: state.peer_count.load(Ordering::Relaxed),
         verified: state.verified.load(Ordering::Relaxed),
         rejected: state.rejected.load(Ordering::Relaxed),
@@ -526,7 +648,7 @@ async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         );
     }
     if let Some(tip) = state.tip.read().unwrap().as_ref() {
-        let cs = &tip.block.header.protocol_state.body.consensus_state;
+        let cs = &tip.header.protocol_state.body.consensus_state;
         m(
             &mut s,
             "mina_light_node_tip_height",
@@ -599,7 +721,7 @@ async fn account(
         .unwrap()
         .clone()
         .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "no verified tip yet"))?;
-    let root = staking_epoch_ledger_hash(&tip.block);
+    let root = staking_epoch_ledger_hash_h(&tip.header);
 
     // Resolve the leaf index: an explicit hint, else from the swept pubkey→index map
     // (monotonic across epochs, so no epoch-root check is needed).

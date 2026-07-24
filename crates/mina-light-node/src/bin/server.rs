@@ -42,7 +42,7 @@ use mina_p2p_messages::binprot::BinProtRead;
 use mina_p2p_messages::v2::{LedgerHash, MinaBaseUserCommandStableV2};
 use mina_relay::broadcast::broadcast_tx;
 use mina_relay::mempool::MempoolView;
-use mina_relay::{network_seeds, rpc_net, subscribe_gossip, PeerId};
+use mina_relay::{network_seeds, rpc_net, subscribe_gossip, Multiaddr, PeerId};
 use mina_verify::{
     block_from_gossip_payload, header_from_precomputed, sync_ledger_queries,
     verify_account_at_root, BlockHeader, ChainMonitor, Ingest, Verifier, LEDGER_DEPTH,
@@ -379,6 +379,19 @@ async fn main() {
         });
     }
 
+    // Inbound p2p: listen so other nodes can dial us (be a real relay, not dial-only).
+    // `LIGHT_NODE_P2P_ADDR` (default `/ip4/0.0.0.0/tcp/8302`, the standard Mina p2p port);
+    // set it empty to stay dial-only. Multiple nodes on one host need distinct ports.
+    let listen: Option<Multiaddr> = match std::env::var("LIGHT_NODE_P2P_ADDR") {
+        Ok(s) if s.trim().is_empty() => None,
+        Ok(s) => Some(s.parse().expect("LIGHT_NODE_P2P_ADDR is a valid multiaddr")),
+        Err(_) => Some(
+            "/ip4/0.0.0.0/tcp/8302"
+                .parse()
+                .expect("default p2p multiaddr"),
+        ),
+    };
+
     // Gossip task: feed blocks to the verifier, tap tx-pool into the mempool view.
     {
         let state = state.clone();
@@ -387,6 +400,7 @@ async fn main() {
             subscribe_gossip(
                 chain_id,
                 peers,
+                listen,
                 None,
                 |src, payload| {
                     match payload.get(8) {

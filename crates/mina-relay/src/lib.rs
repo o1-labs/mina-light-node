@@ -14,13 +14,12 @@ use std::time::Duration;
 use libp2p::kad::{self, store::MemoryStore};
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{
-    futures::StreamExt, gossipsub, multiaddr::Protocol, swarm::SwarmEvent, Multiaddr,
-    StreamProtocol,
+    futures::StreamExt, gossipsub, multiaddr::Protocol, swarm::SwarmEvent, StreamProtocol,
 };
 use transport::ed25519::{Keypair as EdKeypair, SecretKey};
 
-/// Peer identity (re-exported so consumers can name it without depending on libp2p).
-pub use libp2p::PeerId;
+/// Peer identity + multiaddr (re-exported so consumers name them without a libp2p dep).
+pub use libp2p::{Multiaddr, PeerId};
 
 /// Mina's DHT protocol — prefix `/coda` (the daemon sets `dht.ProtocolPrefix("/coda")`),
 /// so peers answer Kademlia queries on `/coda/kad/1.0.0`. Used to discover peers beyond
@@ -132,9 +131,11 @@ pub async fn subscribe_blocks<F, T>(
     // The headless block path doesn't ban peers; hold the sender so the receiver never
     // fires (and isn't seen as closed).
     let (_ban_tx, ban_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Headless block consumers (save-to-disk / dump) don't relay — dial-only.
     subscribe_gossip(
         chain_id,
         peers,
+        None,
         deadline,
         |_src, data| {
             if is_new_state_payload(data) {
@@ -163,6 +164,7 @@ pub async fn subscribe_blocks<F, T>(
 pub async fn subscribe_gossip<F, T>(
     chain_id: &str,
     peers: &[&str],
+    listen: Option<Multiaddr>,
     deadline: Option<Duration>,
     mut on_msg: F,
     mut on_tick: T,
@@ -212,10 +214,13 @@ pub async fn subscribe_gossip<F, T>(
     // pnet PSK = Blake2b256("/coda/0.0.1/" || chain_id); transport::swarm hashes the
     // bytes we pass with no prefix, so prepend it here.
     let pnet_input = format!("/coda/0.0.1/{chain_id}");
+    if let Some(addr) = &listen {
+        log::info!("listening for inbound p2p on {addr}");
+    }
     let mut swarm = transport::swarm(
         local_key,
         pnet_input.as_bytes(),
-        Vec::<Multiaddr>::new(),
+        listen,
         peers.iter().cloned(),
         behaviour,
     );

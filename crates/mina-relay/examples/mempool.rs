@@ -25,6 +25,7 @@ async fn main() {
     subscribe_gossip(
         chain_id,
         peers,
+        None,
         Some(Duration::from_secs(secs)),
         |_src, payload| {
             let added = view.ingest_gossip(payload);

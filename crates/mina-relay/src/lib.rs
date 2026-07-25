@@ -131,11 +131,13 @@ pub async fn subscribe_blocks<F, T>(
     // The headless block path doesn't ban peers; hold the sender so the receiver never
     // fires (and isn't seen as closed).
     let (_ban_tx, ban_rx) = tokio::sync::mpsc::unbounded_channel();
-    // Headless block consumers (save-to-disk / dump) don't relay — dial-only.
+    // Headless block consumers (save-to-disk / dump) don't relay — dial-only, but keep
+    // discovery on to reach the wider network.
     subscribe_gossip(
         chain_id,
         peers,
         None,
+        true,
         deadline,
         |_src, data| {
             if is_new_state_payload(data) {
@@ -161,10 +163,14 @@ pub async fn subscribe_blocks<F, T>(
 /// message to us) and the raw payload. Peers sent on `ban_rx` are disconnected and
 /// blocklisted — the caller uses this to evict peers that relay invalid-proof blocks
 /// (reactive verification). Pass a never-firing receiver (hold its sender) to disable.
+// TODO: the network knobs (listen/discover/deadline/ban_rx) are due to fold into a
+// `GossipConfig` struct — enough of them now that positional args are error-prone.
+#[allow(clippy::too_many_arguments)]
 pub async fn subscribe_gossip<F, T>(
     chain_id: &str,
     peers: &[&str],
     listen: Option<Multiaddr>,
+    discover: bool,
     deadline: Option<Duration>,
     mut on_msg: F,
     mut on_tick: T,
@@ -232,8 +238,20 @@ pub async fn subscribe_gossip<F, T>(
             swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
         }
     }
-    // Kick off discovery: fill the routing table from the seeds, then expand it.
-    let _ = swarm.behaviour_mut().kad.bootstrap();
+    // Discovery mode: fill the routing table from the seeds, then expand across the DHT.
+    // Static-peer mode (`discover == false`) skips this: the node peers ONLY with the
+    // configured set (e.g. an exchange hooking up to a trusted relay fleet) — predictable
+    // topology, fixed egress allowlist, no dialing of strangers. Trades wider-network
+    // liveness/eclipse-resistance for operational control; safety is unaffected (every
+    // block is still proof-verified regardless of who relayed it).
+    if discover {
+        let _ = swarm.behaviour_mut().kad.bootstrap();
+    } else {
+        log::info!(
+            "static-peer mode: discovery off, peering only with {} configured peer(s)",
+            peers.len()
+        );
+    }
 
     let sleep = async {
         match deadline {
@@ -243,9 +261,9 @@ pub async fn subscribe_gossip<F, T>(
     };
     tokio::pin!(sleep);
     let mut tick = tokio::time::interval(Duration::from_secs(2));
-    // Periodically probe the DHT for new peers (a query for a random key walks the
-    // network and surfaces fresh routing entries we then dial).
-    let mut discover = tokio::time::interval(Duration::from_secs(30));
+    // 30s cadence: DHT probe for new peers (discovery mode) or a re-dial of the fixed
+    // peer set (static mode).
+    let mut discover_tick = tokio::time::interval(Duration::from_secs(30));
     let mut connected = std::collections::HashSet::new();
     // Peers evicted for relaying invalid-proof blocks — never re-dialed/re-accepted.
     let mut banned: std::collections::HashSet<PeerId> = std::collections::HashSet::new();
@@ -257,13 +275,30 @@ pub async fn subscribe_gossip<F, T>(
                 // periodic wake — emit a heartbeat (with the live peer count) / cancel while idle.
                 if let ControlFlow::Break(()) = on_tick(connected.len()) { break; }
             }
-            _ = discover.tick() => {
-                log::info!("peers connected: {} (kad discovery)", connected.len());
-                let _ = swarm.behaviour_mut().kad.get_closest_peers(PeerId::random());
+            _ = discover_tick.tick() => {
+                if discover {
+                    // Probe the DHT for new peers (a query for a random key walks the
+                    // network and surfaces fresh routing entries we then dial).
+                    log::info!("peers connected: {} (kad discovery)", connected.len());
+                    let _ = swarm.behaviour_mut().kad.get_closest_peers(PeerId::random());
+                } else {
+                    // Static mode: no discovery to lean on, so persistently re-dial the
+                    // fixed peer set — a peer that was down at disconnect (or never came
+                    // up) is retried every tick, not just once on ConnectionClosed.
+                    for addr in &peers {
+                        if peer_id_of(addr).is_none_or(|pid| !connected.contains(&pid)) {
+                            let _ = swarm.dial(addr.clone());
+                        }
+                    }
+                }
             }
             maybe_ban = ban_rx.recv() => {
                 if let Some(peer) = maybe_ban {
-                    if banned.insert(peer) {
+                    // Don't auto-ban in static mode: the configured peers are trusted
+                    // infra, so a transient bad block must not evict your own hub.
+                    if !discover {
+                        log::warn!("{peer} relayed an invalid-proof block; not banning (static-peer mode trusts configured peers)");
+                    } else if banned.insert(peer) {
                         log::warn!("banning {peer} (relayed invalid-proof block)");
                         let _ = swarm.disconnect_peer_id(peer);
                         swarm.behaviour_mut().kad.remove_peer(&peer);
@@ -286,7 +321,8 @@ pub async fn subscribe_gossip<F, T>(
                 ))) => {
                     // Discovered a peer — dial it to join the gossip mesh (kad supplies
                     // its addresses). More peers ⇒ better liveness / eclipse resistance.
-                    if !connected.contains(&peer) && !banned.contains(&peer) {
+                    // Ignored in static-peer mode: we never dial beyond the configured set.
+                    if discover && !connected.contains(&peer) && !banned.contains(&peer) {
                         let _ = swarm.dial(peer);
                     }
                 }

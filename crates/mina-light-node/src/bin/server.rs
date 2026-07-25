@@ -392,6 +392,16 @@ async fn main() {
         ),
     };
 
+    // Peer mode. Default: DHT discovery (reach the wider network — best liveness/eclipse
+    // resistance). `LIGHT_NODE_STATIC_PEERS=1` pins the node to its configured seeds only
+    // (no discovery, no auto-ban) — for a wallet/exchange hooking up to a trusted relay
+    // fleet: predictable topology + fixed egress. Safety is unchanged (blocks are still
+    // proof-verified); only network-liveness is delegated to the configured peers.
+    let discover = !matches!(
+        std::env::var("LIGHT_NODE_STATIC_PEERS").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    );
+
     // Gossip task: feed blocks to the verifier, tap tx-pool into the mempool view.
     {
         let state = state.clone();
@@ -401,6 +411,7 @@ async fn main() {
                 chain_id,
                 peers,
                 listen,
+                discover,
                 None,
                 |src, payload| {
                     match payload.get(8) {

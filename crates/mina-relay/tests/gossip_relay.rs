@@ -50,6 +50,7 @@ fn spawn_node(
     chain_id: String,
     peers_list: Vec<String>,
     listen: Option<Multiaddr>,
+    discover: bool,
     msgs: Arc<AtomicU64>,
     peers: Arc<AtomicU64>,
 ) -> JoinHandle<()> {
@@ -60,6 +61,7 @@ fn spawn_node(
             &chain_id,
             &peer_refs,
             listen,
+            discover,
             None,
             move |_src, _payload| {
                 msgs.fetch_add(1, Ordering::Relaxed);
@@ -94,19 +96,19 @@ async fn seedless_node_gets_gossip_relayed_by_a_listening_peer() {
         .expect("set MINA_TEST_CHAIN_ID to the local network's chain id");
     let seed_addr = std::env::var("MINA_TEST_SEED_ADDR")
         .expect("set MINA_TEST_SEED_ADDR to a seed's libp2p multiaddr");
-    let a_listen: Multiaddr = format!("/ip4/127.0.0.1/tcp/{NODE_A_PORT}")
-        .parse()
-        .unwrap();
+    let a_listen: Multiaddr = format!("/ip4/127.0.0.1/tcp/{NODE_A_PORT}").parse().unwrap();
     // B dials A by address only; libp2p learns A's peer id on connect.
     let a_addr = format!("/ip4/127.0.0.1/tcp/{NODE_A_PORT}");
 
-    // Node A: joins the local network (dials the seed) AND listens for inbound peers.
+    // Node A: joins the local network (dials the seed) AND listens for inbound peers;
+    // discovery on, like a relay hub.
     let a_msgs = Arc::new(AtomicU64::new(0));
     let a_peers = Arc::new(AtomicU64::new(0));
     let node_a = spawn_node(
         chain_id.clone(),
         vec![seed_addr],
         Some(a_listen),
+        true,
         a_msgs,
         a_peers.clone(),
     );
@@ -117,13 +119,16 @@ async fn seedless_node_gets_gossip_relayed_by_a_listening_peer() {
         "node A never connected to the local seed"
     );
 
-    // Node B: NO seeds — its only peer is A's listen address.
+    // Node B: NO seeds and discovery OFF (static-peer mode) — its only peer is A's
+    // listen address. This is exactly the exchange/wallet spoke: pinned to a trusted
+    // relay, never dialing strangers.
     let b_msgs = Arc::new(AtomicU64::new(0));
     let b_peers = Arc::new(AtomicU64::new(0));
     let node_b = spawn_node(
         chain_id.clone(),
         vec![a_addr.clone()],
         None,
+        false,
         b_msgs.clone(),
         b_peers.clone(),
     );

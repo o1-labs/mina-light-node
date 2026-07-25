@@ -12,7 +12,7 @@
 //!   GET  /tip                         — verified best tip {height, state_hash, epoch_ledger_hash}
 //!   GET  /account?pubkey=&index=      — trustless balance/nonce (by public key via the
 //!                                       swept index map, or an explicit index hint)
-//!   GET  /mempool                     — best-effort pending tx ids (untrusted)
+//!   GET  /mempool?page=&limit=        — best-effort pending txs, decoded + paginated (untrusted)
 //!   POST /submit  {"tx_hex":"…"}      — broadcast a signed user command to gossip
 //!
 //! Env: MINA_NETWORK (devnet|mainnet), LIGHT_NODE_HTTP_ADDR (default 127.0.0.1:8645),
@@ -39,7 +39,10 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use mina_light_node::{index_map, sweep_index_map};
 use mina_p2p_messages::binprot::BinProtRead;
-use mina_p2p_messages::v2::{LedgerHash, MinaBaseUserCommandStableV2};
+use mina_p2p_messages::v2::{
+    LedgerHash, MinaBaseSignedCommandPayloadBodyStableV2, MinaBaseStakeDelegationStableV2,
+    MinaBaseUserCommandStableV2,
+};
 use mina_relay::broadcast::broadcast_tx;
 use mina_relay::mempool::MempoolView;
 use mina_relay::{network_seeds, rpc_net, subscribe_gossip, PeerId};
@@ -794,17 +797,110 @@ async fn account(
 
 #[derive(Serialize)]
 struct MempoolResponse {
+    /// Total pending transactions in the view (after expiry) — the full set, not the page.
     count: usize,
-    transaction_ids: Vec<String>,
+    page: usize,
+    limit: usize,
+    transactions: Vec<MempoolTx>,
 }
 
-async fn mempool(State(state): State<Arc<AppState>>) -> Json<MempoolResponse> {
+/// A decoded pending transaction. Best-effort + untrusted (a gossip view, not an
+/// authoritative pool); the fields are what an explorer / Rosetta caller expects.
+#[derive(Serialize)]
+struct MempoolTx {
+    /// Canonical Mina tx hash (`5J…`) — the Rosetta `transaction_identifier`.
+    id: String,
+    /// `payment` | `delegation` | `zkapp`.
+    kind: &'static str,
+    /// Fee payer / source (B62).
+    from: String,
+    /// Payment receiver or new delegate (B62); `null` for zkApp commands.
+    to: Option<String>,
+    /// Amount in nanomina; `null` for delegation / zkApp.
+    amount: Option<u64>,
+    /// Fee in nanomina.
+    fee: u64,
+    nonce: u32,
+    /// Memo, base58check-encoded (as explorers show it).
+    memo: String,
+    /// Seconds this tx has been in our view.
+    seconds_pending: u64,
+}
+
+/// Decode a pending command into the API shape. All conversions are infallible getters
+/// on the p2p types (pubkeys via `Base58CheckOfBinProt`'s `Display`, currency via
+/// `as_u64`), so this never fails — a zkApp command just carries less (no to/amount).
+fn summarize(tx: &mina_relay::mempool::PendingTx) -> MempoolTx {
+    let seconds_pending = tx.first_seen.elapsed().as_secs();
+    let id = tx.id.clone();
+    match &tx.command {
+        MinaBaseUserCommandStableV2::SignedCommand(sc) => {
+            let common = &sc.payload.common;
+            let (kind, to, amount) = match &sc.payload.body {
+                MinaBaseSignedCommandPayloadBodyStableV2::Payment(p) => (
+                    "payment",
+                    Some(p.receiver_pk.to_string()),
+                    Some(p.amount.as_u64()),
+                ),
+                MinaBaseSignedCommandPayloadBodyStableV2::StakeDelegation(
+                    MinaBaseStakeDelegationStableV2::SetDelegate { new_delegate },
+                ) => ("delegation", Some(new_delegate.to_string()), None),
+            };
+            MempoolTx {
+                id,
+                kind,
+                from: common.fee_payer_pk.to_string(),
+                to,
+                amount,
+                fee: common.fee.as_u64(),
+                nonce: common.nonce.as_u32(),
+                memo: common.memo.to_base58check(),
+                seconds_pending,
+            }
+        }
+        MinaBaseUserCommandStableV2::ZkappCommand(zc) => {
+            let fp = &zc.fee_payer.body;
+            MempoolTx {
+                id,
+                kind: "zkapp",
+                from: fp.public_key.to_string(),
+                to: None,
+                amount: None,
+                fee: fp.fee.as_u64(),
+                nonce: fp.nonce.as_u32(),
+                memo: zc.memo.to_base58check(),
+                seconds_pending,
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct MempoolQuery {
+    /// 0-based page index (default 0).
+    #[serde(default)]
+    page: usize,
+    /// Page size (default 50, capped at 200).
+    limit: Option<usize>,
+}
+
+async fn mempool(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<MempoolQuery>,
+) -> Json<MempoolResponse> {
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let mut view = state.mempool.lock().unwrap();
     view.expire();
-    let ids = view.ids();
+    let count = view.len();
+    // Newest-first so the freshest txs are page 0 and paging is deterministic per snapshot.
+    let mut txs: Vec<MempoolTx> = view.iter().map(summarize).collect();
+    txs.sort_by_key(|t| t.seconds_pending);
+    let transactions = txs.into_iter().skip(q.page * limit).take(limit).collect();
     Json(MempoolResponse {
-        count: ids.len(),
-        transaction_ids: ids,
+        count,
+        page: q.page,
+        limit,
+        transactions,
     })
 }
 

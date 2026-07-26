@@ -110,16 +110,28 @@ struct AppState {
     stale_secs: u64,
 }
 
-/// Freshness of the verified tip: `(seconds_since_verified, is_fresh)`. `seconds` is
-/// `None` before the first verification. `is_fresh` is false with no tip yet or once the
-/// last verification is older than `stale_secs` — the signal `/ready` gates traffic on.
-fn freshness(state: &AppState) -> (Option<u64>, bool) {
+/// Freshness of the verified tip — the signal `/ready` gates traffic on and `/tip`
+/// reports.
+struct Freshness {
+    /// Seconds since the last successful verification; `None` before the first one.
+    seconds_since_verified: Option<u64>,
+    /// True only when a verification has happened and it is within `stale_secs`.
+    is_fresh: bool,
+}
+
+fn freshness(state: &AppState) -> Freshness {
     let last = state.last_verified_unix.load(Ordering::Relaxed);
     if last == 0 {
-        return (None, false);
+        return Freshness {
+            seconds_since_verified: None,
+            is_fresh: false,
+        };
     }
     let since = now_unix().saturating_sub(last);
-    (Some(since), since <= state.stale_secs)
+    Freshness {
+        seconds_since_verified: Some(since),
+        is_fresh: since <= state.stale_secs,
+    }
 }
 
 /// Build the network verifier — from `MINA_VK_JSON` (a caller-supplied verifier-index,
@@ -536,14 +548,14 @@ struct TipResponse {
 async fn tip(State(state): State<Arc<AppState>>) -> Result<Json<TipResponse>, ApiError> {
     let tip = state.tip.read().unwrap().clone();
     let tip = tip.ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "no verified tip yet"))?;
-    let (seconds_since_verified, fresh) = freshness(&state);
+    let f = freshness(&state);
     Ok(Json(TipResponse {
         network: state.network.clone(),
         height: tip.height,
         state_hash: tip.state_hash,
         staking_epoch_ledger_hash: staking_epoch_ledger_hash_h(&tip.header).to_string(),
-        seconds_since_verified,
-        fresh,
+        seconds_since_verified: f.seconds_since_verified,
+        fresh: f.is_fresh,
     }))
 }
 
@@ -553,9 +565,9 @@ async fn tip(State(state): State<Arc<AppState>>) -> Result<Json<TipResponse>, Ap
 /// Gating on this endpoint (not `/health`) avoids the classic trap where a liveness
 /// probe kills a container that is merely still syncing.
 async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let (since, fresh) = freshness(&state);
+    let f = freshness(&state);
     let has_tip = state.tip.read().unwrap().is_some();
-    let (code, status) = match (has_tip, fresh) {
+    let (code, status) = match (has_tip, f.is_fresh) {
         (true, true) => (StatusCode::OK, "ready"),
         (false, _) => (StatusCode::SERVICE_UNAVAILABLE, "no verified tip yet"),
         (true, false) => (StatusCode::SERVICE_UNAVAILABLE, "stale"),
@@ -564,7 +576,7 @@ async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         code,
         Json(serde_json::json!({
             "status": status,
-            "seconds_since_verified": since,
+            "seconds_since_verified": f.seconds_since_verified,
             "stale_after_secs": state.stale_secs,
         })),
     )

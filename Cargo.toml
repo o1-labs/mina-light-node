@@ -23,7 +23,7 @@ mina-p2p-messages = { git = "https://github.com/o1-labs/mina-rust", rev = "ab69e
 binprot = { git = "https://github.com/openmina/binprot-rs", rev = "400b52c" }
 libp2p = { git = "https://github.com/o1-labs/rust-libp2p", rev = "e88cec09bd2554f4cc79ff90f200e4c864adf495", default-features = false }
 
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 blake2 = "0.10"
 hex = "0.4"
 pin-project-lite = "0.2"

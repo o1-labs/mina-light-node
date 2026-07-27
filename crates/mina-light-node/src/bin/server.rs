@@ -112,6 +112,7 @@ struct AppState {
 
 /// Freshness of the verified tip — the signal `/ready` gates traffic on and `/tip`
 /// reports.
+#[derive(Default)]
 struct Freshness {
     /// Seconds since the last successful verification; `None` before the first one.
     seconds_since_verified: Option<u64>,
@@ -122,10 +123,8 @@ struct Freshness {
 fn freshness(state: &AppState) -> Freshness {
     let last = state.last_verified_unix.load(Ordering::Relaxed);
     if last == 0 {
-        return Freshness {
-            seconds_since_verified: None,
-            is_fresh: false,
-        };
+        // No verification yet: seconds_since_verified None + is_fresh false.
+        return Freshness::default();
     }
     let since = now_unix().saturating_sub(last);
     Freshness {

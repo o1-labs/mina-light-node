@@ -106,6 +106,10 @@ struct AppState {
     /// Connected peer count (live) and peers banned for relaying invalid-proof blocks.
     peer_count: AtomicU64,
     banned: AtomicU64,
+    /// Times the gossip task was restarted after the swarm stream ended — a supervised
+    /// gossip loop, so the mempool tap + block feed don't silently die. Non-zero means
+    /// the p2p connection has dropped at least once.
+    gossip_restarts: AtomicU64,
     /// Unix seconds of the last successful verification (0 = none yet) — sync freshness.
     last_verified_unix: AtomicU64,
     /// A tip older than this many seconds is considered stale — `/ready` fails and
@@ -263,6 +267,7 @@ async fn main() {
         forks: AtomicU64::new(0),
         peer_count: AtomicU64::new(0),
         banned: AtomicU64::new(0),
+        gossip_restarts: AtomicU64::new(0),
         last_verified_unix: AtomicU64::new(0),
         stale_secs: std::env::var("LIGHT_NODE_STALE_SECS")
             .ok()
@@ -326,11 +331,18 @@ async fn main() {
     const BLOCK_QUEUE: usize = 256;
     let (block_tx, block_rx) = mpsc::sync_channel::<(PeerId, Vec<u8>)>(BLOCK_QUEUE);
     // Reactive verification: the worker asks the gossip loop to disconnect+blocklist a
-    // peer once it relays too many invalid-proof blocks.
-    let (ban_tx, ban_rx) = tokio::sync::mpsc::unbounded_channel::<PeerId>();
+    // peer once it relays too many invalid-proof blocks. The sender lives behind a holder
+    // so the supervised gossip loop can swap in a fresh receiver on each restart while the
+    // worker keeps a stable handle. The first (throwaway) receiver is dropped immediately;
+    // the gossip loop installs the live one before it starts.
+    let ban_holder: Arc<Mutex<tokio::sync::mpsc::UnboundedSender<PeerId>>> = {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<PeerId>();
+        Arc::new(Mutex::new(tx))
+    };
     {
         let net = network.clone();
         let state = state.clone();
+        let ban_holder = ban_holder.clone();
         std::thread::spawn(move || {
             // Fail loud if we can't build a verifier — a light *node* that can't verify
             // is just an untrusted relay. (Without this the thread would die and the
@@ -404,7 +416,9 @@ async fn main() {
                         log::warn!("rejected invalid block proof from {src} (strike {n})");
                         if *n == BAN_THRESHOLD {
                             state.banned.fetch_add(1, Ordering::Relaxed);
-                            let _ = ban_tx.send(src); // evict: disconnect + blocklist
+                            // Send via the current gossip receiver (dropped if gossip is
+                            // mid-restart — a ban during a p2p outage is moot anyway).
+                            let _ = ban_holder.lock().unwrap().send(src);
                         }
                     }
                     Err(e) => log::debug!("malformed block (skipped): {e:?}"),
@@ -437,41 +451,63 @@ async fn main() {
     );
 
     // Gossip task: feed blocks to the verifier, tap tx-pool into the mempool view.
+    // SUPERVISED: `subscribe_gossip` (deadline None) only returns if the swarm stream
+    // ends. Without a restart loop the task would exit silently and the mempool tap +
+    // block feed would freeze while the process stayed "healthy". Restart with a short
+    // backoff, resetting peer_count and counting restarts.
     {
         let state = state.clone();
+        let ban_holder = ban_holder.clone();
         tokio::spawn(async move {
-            let tick_state = state.clone();
-            subscribe_gossip(
-                chain_id,
-                peers,
-                listen,
-                discover,
-                None,
-                |src, payload| {
-                    match payload.get(8) {
-                        Some(0) if use_gossip_blocks => {
-                            // Non-blocking: never stall the gossip/async runtime on a full
-                            // queue. Drop-newest on backlog — gossip re-delivers the block.
-                            if let Err(mpsc::TrySendError::Full(_)) =
-                                block_tx.try_send((src, payload.to_vec()))
-                            {
-                                log::warn!("verify queue full ({BLOCK_QUEUE}); dropped a block (gossip will re-deliver)");
+            const RESTART_BACKOFF: Duration = Duration::from_secs(5);
+            loop {
+                // Fresh ban channel each run; the worker sends via `ban_holder`.
+                let (ban_tx, ban_rx) = tokio::sync::mpsc::unbounded_channel::<PeerId>();
+                *ban_holder.lock().unwrap() = ban_tx;
+                let listen = listen.clone();
+                let block_tx = block_tx.clone();
+                let msg_state = state.clone();
+                let tick_state = state.clone();
+                subscribe_gossip(
+                    chain_id,
+                    peers,
+                    listen,
+                    discover,
+                    None,
+                    move |src, payload| {
+                        match payload.get(8) {
+                            Some(0) if use_gossip_blocks => {
+                                // Non-blocking: never stall the gossip/async runtime on a
+                                // full queue. Drop-newest on backlog — gossip re-delivers.
+                                if let Err(mpsc::TrySendError::Full(_)) =
+                                    block_tx.try_send((src, payload.to_vec()))
+                                {
+                                    log::warn!("verify queue full ({BLOCK_QUEUE}); dropped a block (gossip will re-deliver)");
+                                }
                             }
+                            Some(2) => {
+                                msg_state.mempool.lock().unwrap().ingest_gossip(payload);
+                            }
+                            _ => {}
                         }
-                        Some(2) => {
-                            state.mempool.lock().unwrap().ingest_gossip(payload);
-                        }
-                        _ => {}
-                    }
-                    ControlFlow::Continue(())
-                },
-                move |n| {
-                    tick_state.peer_count.store(n as u64, Ordering::Relaxed);
-                    ControlFlow::Continue(())
-                },
-                ban_rx,
-            )
-            .await;
+                        ControlFlow::Continue(())
+                    },
+                    move |n| {
+                        tick_state.peer_count.store(n as u64, Ordering::Relaxed);
+                        ControlFlow::Continue(())
+                    },
+                    ban_rx,
+                )
+                .await;
+
+                let n = state.gossip_restarts.fetch_add(1, Ordering::Relaxed) + 1;
+                state.peer_count.store(0, Ordering::Relaxed);
+                log::warn!(
+                    "gossip task exited (swarm stream ended); restart #{n} in {}s",
+                    RESTART_BACKOFF.as_secs()
+                );
+                tokio::time::sleep(RESTART_BACKOFF).await;
+            }
         });
     }
 
@@ -627,6 +663,8 @@ struct StatusResponse {
     reorgs: u64,
     forks: u64,
     banned: u64,
+    /// Times the gossip task has been restarted (non-zero ⇒ p2p dropped at least once).
+    gossip_restarts: u64,
     uptime_secs: u64,
     /// Sync freshness; `null` until the first verified tip.
     seconds_since_last_verified: Option<u64>,
@@ -656,6 +694,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<StatusRespons
         reorgs: state.reorgs.load(Ordering::Relaxed),
         forks: state.forks.load(Ordering::Relaxed),
         banned: state.banned.load(Ordering::Relaxed),
+        gossip_restarts: state.gossip_restarts.load(Ordering::Relaxed),
         uptime_secs: state.started.elapsed().as_secs(),
         seconds_since_last_verified: (last != 0).then(|| now_unix().saturating_sub(last)),
     }))
@@ -728,6 +767,13 @@ async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "counter",
         "peers banned for relaying invalid-proof blocks",
         state.banned.load(Ordering::Relaxed),
+    );
+    m(
+        &mut s,
+        "mina_light_node_gossip_restarts_total",
+        "counter",
+        "gossip task restarts after the swarm stream ended",
+        state.gossip_restarts.load(Ordering::Relaxed),
     );
 
     let last = state.last_verified_unix.load(Ordering::Relaxed);

@@ -123,17 +123,26 @@ struct Freshness {
     is_fresh: bool,
 }
 
-fn freshness(state: &AppState) -> Freshness {
-    let last = state.last_verified_unix.load(Ordering::Relaxed);
-    if last == 0 {
+/// Pure core of [`freshness`] with the clock injected, so it is deterministically
+/// testable. `last_verified_unix == 0` means "no verification yet".
+fn freshness_at(now: u64, last_verified_unix: u64, stale_secs: u64) -> Freshness {
+    if last_verified_unix == 0 {
         // No verification yet: seconds_since_verified None + is_fresh false.
         return Freshness::default();
     }
-    let since = now_unix().saturating_sub(last);
+    let since = now.saturating_sub(last_verified_unix);
     Freshness {
         seconds_since_verified: Some(since),
-        is_fresh: since <= state.stale_secs,
+        is_fresh: since <= stale_secs,
     }
+}
+
+fn freshness(state: &AppState) -> Freshness {
+    freshness_at(
+        now_unix(),
+        state.last_verified_unix.load(Ordering::Relaxed),
+        state.stale_secs,
+    )
 }
 
 /// Build the network verifier — from `MINA_VK_JSON` (a caller-supplied verifier-index,
@@ -166,10 +175,18 @@ fn adopt_tip(state: &Arc<AppState>, info: TipInfo) {
     }
 }
 
+/// Parse a precomputed-block filename stem `<net>-<height>-<state_hash>` into
+/// `(height, state_hash)`. Parses from the right so a net prefix containing '-' (e.g.
+/// `mesa-mut`) is handled: the state hash is the last '-' segment, the height the one
+/// before it. Returns `None` if the shape is wrong or the height isn't a number.
+fn parse_precomputed_stem(stem: &str) -> Option<(u32, &str)> {
+    let (rest, state_hash) = stem.rsplit_once('-')?;
+    let (_net, height) = rest.rsplit_once('-')?;
+    Some((height.parse().ok()?, state_hash))
+}
+
 /// The highest-numbered precomputed block in `dir`, as `(height, state_hash, path)`.
-/// Files are named `<net>-<height>-<state_hash>.json` (the indexer's layout). The net
-/// prefix may itself contain '-' (e.g. `mesa-mut`), so parse from the right: the state
-/// hash is the last '-' segment and the height the one before it.
+/// Files are named `<net>-<height>-<state_hash>.json` (the indexer's layout).
 fn latest_precomputed(dir: &str, skip: &HashSet<u32>) -> Option<(u32, String, std::path::PathBuf)> {
     std::fs::read_dir(dir)
         .ok()?
@@ -177,9 +194,7 @@ fn latest_precomputed(dir: &str, skip: &HashSet<u32>) -> Option<(u32, String, st
         .filter_map(|e| {
             let path = e.path();
             let stem = path.file_name()?.to_str()?.strip_suffix(".json")?;
-            let (rest, state_hash) = stem.rsplit_once('-')?;
-            let (_net, height) = rest.rsplit_once('-')?;
-            let height: u32 = height.parse().ok()?;
+            let (height, state_hash) = parse_precomputed_stem(stem)?;
             (!skip.contains(&height)).then_some((height, state_hash.to_string(), path))
         })
         .max_by_key(|(h, _, _)| *h)
@@ -974,18 +989,29 @@ struct MempoolQuery {
     limit: Option<usize>,
 }
 
+/// Clamp `limit` to `[1, 200]` (default 50) and take the `page`-th slice of `items`.
+/// Returns `(effective_limit, page_items)`. A page past the end yields an empty slice.
+fn page_slice<T>(items: Vec<T>, page: usize, limit: Option<usize>) -> (usize, Vec<T>) {
+    let limit = limit.unwrap_or(50).clamp(1, 200);
+    let slice = items
+        .into_iter()
+        .skip(page.saturating_mul(limit))
+        .take(limit)
+        .collect();
+    (limit, slice)
+}
+
 async fn mempool(
     State(state): State<Arc<AppState>>,
     Query(q): Query<MempoolQuery>,
 ) -> Json<MempoolResponse> {
-    let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let mut view = state.mempool.lock().unwrap();
     view.expire();
     let count = view.len();
     // Newest-first so the freshest txs are page 0 and paging is deterministic per snapshot.
     let mut txs: Vec<MempoolTx> = view.iter().map(summarize).collect();
     txs.sort_by_key(|t| t.seconds_pending);
-    let transactions = txs.into_iter().skip(q.page * limit).take(limit).collect();
+    let (limit, transactions) = page_slice(txs, q.page, q.limit);
     Json(MempoolResponse {
         count,
         page: q.page,
@@ -1032,4 +1058,135 @@ async fn submit(
         published: true,
         echoes: outcome.echoes,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_precomputed_stem_normal() {
+        assert_eq!(
+            parse_precomputed_stem("devnet-527923-3NLUJH2BCEE"),
+            Some((527923, "3NLUJH2BCEE"))
+        );
+    }
+
+    #[test]
+    fn parse_precomputed_stem_network_with_dash() {
+        // The net prefix contains '-'; height must still be the second-to-last segment.
+        assert_eq!(
+            parse_precomputed_stem("mesa-mut-302075-3NKueNRxvz"),
+            Some((302075, "3NKueNRxvz"))
+        );
+    }
+
+    #[test]
+    fn parse_precomputed_stem_rejects_bad_shapes() {
+        assert_eq!(parse_precomputed_stem("noseparators"), None);
+        assert_eq!(parse_precomputed_stem("net-only"), None); // only one '-'
+        assert_eq!(parse_precomputed_stem("net-notanumber-hash"), None);
+    }
+
+    #[test]
+    fn freshness_no_verification_yet() {
+        let f = freshness_at(1_000, 0, 900);
+        assert_eq!(f.seconds_since_verified, None);
+        assert!(!f.is_fresh);
+    }
+
+    #[test]
+    fn freshness_within_threshold_is_fresh() {
+        let f = freshness_at(1_500, 1_000, 900); // 500s old, threshold 900
+        assert_eq!(f.seconds_since_verified, Some(500));
+        assert!(f.is_fresh);
+    }
+
+    #[test]
+    fn freshness_at_threshold_is_still_fresh() {
+        let f = freshness_at(1_900, 1_000, 900); // exactly 900s old
+        assert_eq!(f.seconds_since_verified, Some(900));
+        assert!(f.is_fresh);
+    }
+
+    #[test]
+    fn freshness_past_threshold_is_stale() {
+        let f = freshness_at(2_000, 1_000, 900); // 1000s old, threshold 900
+        assert_eq!(f.seconds_since_verified, Some(1_000));
+        assert!(!f.is_fresh);
+    }
+
+    #[test]
+    fn freshness_clock_skew_saturates_to_zero() {
+        // last_verified in the "future" (clock skew) must not underflow.
+        let f = freshness_at(1_000, 1_050, 900);
+        assert_eq!(f.seconds_since_verified, Some(0));
+        assert!(f.is_fresh);
+    }
+
+    #[test]
+    fn summarize_decodes_a_real_payment() {
+        // Fixture: a real devnet payment (captured off tx-pool gossip). Ground truth is
+        // the daemon's own decode of the same command.
+        let hex = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/devnet_payment.hex"
+        ))
+        .trim();
+        let bytes = hex::decode(hex).expect("fixture is valid hex");
+        let command = MinaBaseUserCommandStableV2::binprot_read(&mut &bytes[..])
+            .expect("fixture decodes as a user command");
+        let tx = mina_relay::mempool::PendingTx {
+            id: mina_relay::mempool::command_id(&command),
+            command,
+            first_seen: Instant::now(),
+        };
+
+        let s = summarize(&tx);
+        assert_eq!(s.kind, "payment");
+        assert_eq!(s.id, "5Jtzfmp53di1grF4GfxhkG8knbtpJDjqQamGCQKUkek4eb7sFrki");
+        assert_eq!(
+            s.from,
+            "B62qp3B9VW1ir5qL1MWRwr6ecjC2NZbGr8vysGeme9vXGcFXTMNXb2t"
+        );
+        assert_eq!(
+            s.to.as_deref(),
+            Some("B62qp3B9VW1ir5qL1MWRwr6ecjC2NZbGr8vysGeme9vXGcFXTMNXb2t")
+        );
+        assert_eq!(s.amount, Some(10_000_000));
+        assert_eq!(s.fee, 10_000_000);
+        assert_eq!(s.nonce, 724_636);
+        assert_eq!(
+            s.memo,
+            "E4YzjHJ6ds2xcGuWvfVGQzp6HXhk5R2c5xrj9apXH5ER941pRxqmS"
+        );
+    }
+
+    #[test]
+    fn page_slice_defaults_and_clamps_limit() {
+        let items: Vec<u32> = (0..300).collect();
+        // default 50
+        assert_eq!(page_slice(items.clone(), 0, None).0, 50);
+        // clamp low: 0 -> 1
+        assert_eq!(page_slice(items.clone(), 0, Some(0)).0, 1);
+        // clamp high: >200 -> 200
+        assert_eq!(page_slice(items.clone(), 0, Some(1000)).0, 200);
+        // in range preserved
+        assert_eq!(page_slice(items, 0, Some(25)).0, 25);
+    }
+
+    #[test]
+    fn page_slice_pages_correctly() {
+        let items: Vec<u32> = (0..25).collect();
+        let (_, p0) = page_slice(items.clone(), 0, Some(10));
+        assert_eq!(p0, (0..10).collect::<Vec<_>>());
+        let (_, p1) = page_slice(items.clone(), 1, Some(10));
+        assert_eq!(p1, (10..20).collect::<Vec<_>>());
+        // last, partial page
+        let (_, p2) = page_slice(items.clone(), 2, Some(10));
+        assert_eq!(p2, (20..25).collect::<Vec<_>>());
+        // past the end -> empty
+        let (_, p3) = page_slice(items, 3, Some(10));
+        assert!(p3.is_empty());
+    }
 }

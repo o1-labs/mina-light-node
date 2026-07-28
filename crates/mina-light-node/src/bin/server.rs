@@ -49,7 +49,8 @@ use mina_relay::mempool::MempoolView;
 use mina_relay::{network_seeds, rpc_net, subscribe_gossip, Multiaddr, PeerId};
 use mina_verify::{
     block_from_gossip_payload, header_from_precomputed, sync_ledger_queries,
-    verify_account_at_root, BlockHeader, ChainMonitor, Ingest, Verifier, LEDGER_DEPTH,
+    verify_account_at_root, BlockHeader, ChainMonitor, Ingest, Verifier, VerifierError,
+    LEDGER_DEPTH,
 };
 use serde::{Deserialize, Serialize};
 
@@ -179,29 +180,30 @@ fn adopt_tip(state: &Arc<AppState>, info: TipInfo) {
     }
 }
 
-/// Parse a precomputed-block filename stem `<net>-<height>-<state_hash>` into
-/// `(height, state_hash)`. Parses from the right so a net prefix containing '-' (e.g.
-/// `mesa-mut`) is handled: the state hash is the last '-' segment, the height the one
-/// before it. Returns `None` if the shape is wrong or the height isn't a number.
-fn parse_precomputed_stem(stem: &str) -> Option<(u32, &str)> {
-    let (rest, state_hash) = stem.rsplit_once('-')?;
+/// Parse the **height** out of a precomputed-block filename stem
+/// `<net>-<height>-<state_hash>`. The height is the second-to-last '-' segment (parse
+/// from the right, since the net prefix may itself contain '-', e.g. `mesa-mut`). Only
+/// the height is read — it's the cheap selection key that avoids decoding every file; the
+/// trusted state hash comes from verifying the block, not the (untrusted) filename.
+fn parse_precomputed_height(stem: &str) -> Option<u32> {
+    let (rest, _state_hash) = stem.rsplit_once('-')?;
     let (_net, height) = rest.rsplit_once('-')?;
-    Some((height.parse().ok()?, state_hash))
+    height.parse().ok()
 }
 
-/// The highest-numbered precomputed block in `dir`, as `(height, state_hash, path)`.
-/// Files are named `<net>-<height>-<state_hash>.json` (the indexer's layout).
-fn latest_precomputed(dir: &str, skip: &HashSet<u32>) -> Option<(u32, String, std::path::PathBuf)> {
+/// The highest-numbered precomputed block in `dir`, as `(height, path)`. Files are named
+/// `<net>-<height>-<state_hash>.json` (the indexer's layout).
+fn latest_precomputed(dir: &str, skip: &HashSet<u32>) -> Option<(u32, std::path::PathBuf)> {
     std::fs::read_dir(dir)
         .ok()?
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let path = e.path();
             let stem = path.file_name()?.to_str()?.strip_suffix(".json")?;
-            let (height, state_hash) = parse_precomputed_stem(stem)?;
-            (!skip.contains(&height)).then_some((height, state_hash.to_string(), path))
+            let height = parse_precomputed_height(stem)?;
+            (!skip.contains(&height)).then_some((height, path))
         })
-        .max_by_key(|(h, _, _)| *h)
+        .max_by_key(|(h, _)| *h)
 }
 
 /// Poll the indexer's precomputed-block dir; verify each new tip's header proof (the
@@ -217,32 +219,42 @@ fn precomputed_block_loop(verifier: &Verifier, state: &Arc<AppState>, dir: &str)
         // wedge tip adoption; we fall back to the highest good block below it. `skip`
         // resets per cycle so a transiently-bad file (mid-write) is retried next time.
         let mut skip: HashSet<u32> = HashSet::new();
-        while let Some((height, state_hash, path)) = latest_precomputed(dir, &skip) {
+        while let Some((height, path)) = latest_precomputed(dir, &skip) {
             if height <= last {
                 break;
             }
             match std::fs::read_to_string(&path).map(|j| header_from_precomputed(&j)) {
-                Ok(Ok(header)) if verifier.verify_header(&header) => {
-                    state.verified.fetch_add(1, Ordering::Relaxed);
-                    state
-                        .last_verified_unix
-                        .store(now_unix(), Ordering::Relaxed);
-                    let cs = &header.protocol_state.body.consensus_state;
-                    adopt_tip(
-                        state,
-                        TipInfo {
-                            height: cs.blockchain_length.as_u32(),
-                            state_hash,
-                            header,
-                        },
-                    );
-                    last = height;
-                }
-                Ok(Ok(_)) => {
-                    state.rejected.fetch_add(1, Ordering::Relaxed);
-                    log::warn!("precomputed block h{height} failed proof verification — skipped");
-                    skip.insert(height);
-                }
+                // `verify_and_extract` is the trust gate: it verifies the proof AND returns
+                // the block's proof-backed facts (height + the state hash computed from the
+                // header via `try_hash`, not the untrusted filename).
+                Ok(Ok(header)) => match verifier.verify_and_extract(&header) {
+                    Ok(vb) => {
+                        state.verified.fetch_add(1, Ordering::Relaxed);
+                        state
+                            .last_verified_unix
+                            .store(now_unix(), Ordering::Relaxed);
+                        adopt_tip(
+                            state,
+                            TipInfo {
+                                height: vb.height,
+                                state_hash: vb.state_hash.to_string(),
+                                header,
+                            },
+                        );
+                        last = height;
+                    }
+                    Err(VerifierError::ProofInvalid) => {
+                        state.rejected.fetch_add(1, Ordering::Relaxed);
+                        log::warn!(
+                            "precomputed block h{height} failed proof verification — skipped"
+                        );
+                        skip.insert(height);
+                    }
+                    Err(e) => {
+                        log::warn!("precomputed block h{height} malformed: {e:?} — skipped");
+                        skip.insert(height);
+                    }
+                },
                 Ok(Err(e)) => {
                     log::warn!("decode precomputed block h{height}: {e}");
                     skip.insert(height);
@@ -1111,27 +1123,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_precomputed_stem_normal() {
+    fn parse_precomputed_height_normal() {
         assert_eq!(
-            parse_precomputed_stem("devnet-527923-3NLUJH2BCEE"),
-            Some((527923, "3NLUJH2BCEE"))
+            parse_precomputed_height("devnet-527923-3NLUJH2BCEE"),
+            Some(527923)
         );
     }
 
     #[test]
-    fn parse_precomputed_stem_network_with_dash() {
+    fn parse_precomputed_height_network_with_dash() {
         // The net prefix contains '-'; height must still be the second-to-last segment.
         assert_eq!(
-            parse_precomputed_stem("mesa-mut-302075-3NKueNRxvz"),
-            Some((302075, "3NKueNRxvz"))
+            parse_precomputed_height("mesa-mut-302075-3NKueNRxvz"),
+            Some(302075)
         );
     }
 
     #[test]
-    fn parse_precomputed_stem_rejects_bad_shapes() {
-        assert_eq!(parse_precomputed_stem("noseparators"), None);
-        assert_eq!(parse_precomputed_stem("net-only"), None); // only one '-'
-        assert_eq!(parse_precomputed_stem("net-notanumber-hash"), None);
+    fn parse_precomputed_height_rejects_bad_shapes() {
+        assert_eq!(parse_precomputed_height("noseparators"), None);
+        assert_eq!(parse_precomputed_height("net-only"), None); // only one '-'
+        assert_eq!(parse_precomputed_height("net-notanumber-hash"), None);
     }
 
     #[test]

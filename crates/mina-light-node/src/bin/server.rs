@@ -17,7 +17,9 @@
 //!   POST /submit  {"tx_hex":"…"}      — broadcast a signed user command to gossip
 //!
 //! Env: MINA_NETWORK (devnet|mainnet), LIGHT_NODE_HTTP_ADDR (default 127.0.0.1:8645),
-//!      MINA_VK_JSON (optional, for networks without an embedded VK).
+//!      MINA_VK_JSON (optional, for networks without an embedded VK),
+//!      LIGHT_NODE_PEERS (optional comma-separated multiaddrs — override the seed peers,
+//!      e.g. to pin a static-peer spoke to a relay fleet; see LIGHT_NODE_STATIC_PEERS).
 
 // jemalloc returns freed memory to the OS far better than glibc malloc, whose per-thread
 // arenas retain the verifier's large transient allocations and ratchet RSS to a high
@@ -169,6 +171,19 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Parse a `LIGHT_NODE_PEERS` value into a peer list, or `None` to fall back to the
+/// network's default seeds. Comma-separated; each entry trimmed; blank entries dropped;
+/// an all-blank value yields `None`. Multiaddr validity is checked later at dial time.
+fn parse_peer_override(raw: &str) -> Option<Vec<String>> {
+    let list: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(String::from)
+        .collect();
+    (!list.is_empty()).then_some(list)
+}
+
 /// Adopt `info` as the tip if it's strictly newer than the current one. Used by the
 /// precomputed-block source (the gossip worker adopts via fork-choice instead).
 fn adopt_tip(state: &Arc<AppState>, info: TipInfo) {
@@ -261,8 +276,32 @@ fn precomputed_block_loop(verifier: &Verifier, state: &Arc<AppState>, dir: &str)
 async fn main() {
     env_logger::init();
     let network = std::env::var("MINA_NETWORK").unwrap_or_else(|_| "devnet".into());
-    let (chain_id, peers) =
+    let (chain_id, seed_peers) =
         network_seeds(&network).unwrap_or_else(|| panic!("unknown MINA_NETWORK {network:?}"));
+
+    // Peer set: the network's published seeds by default, or an explicit override via
+    // `LIGHT_NODE_PEERS` (comma-separated multiaddrs). The override keeps the network's
+    // chain_id — it just changes *who* we dial. Paired with `LIGHT_NODE_STATIC_PEERS=1`
+    // this pins the node to a chosen relay fleet (a wallet/exchange spoke) and never
+    // dials the public seeds. Leaked to `'static` once at startup so the whole peer
+    // plumbing (gossip, sync-ledger reads, broadcast) stays borrow-free.
+    let peers: &'static [&'static str] = match std::env::var("LIGHT_NODE_PEERS")
+        .ok()
+        .and_then(|s| parse_peer_override(&s))
+    {
+        Some(list) => {
+            log::info!(
+                "LIGHT_NODE_PEERS override: {} configured peer(s)",
+                list.len()
+            );
+            let leaked: Vec<&'static str> = list
+                .into_iter()
+                .map(|p| &*Box::leak(p.into_boxed_str()))
+                .collect();
+            Box::leak(leaked.into_boxed_slice())
+        }
+        None => seed_peers,
+    };
     let addr: SocketAddr = std::env::var("LIGHT_NODE_HTTP_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:8645".into())
         .parse()
@@ -1234,5 +1273,30 @@ mod tests {
         // past the end -> empty
         let (_, p3) = page_slice(items, 3, Some(10));
         assert!(p3.is_empty());
+    }
+
+    #[test]
+    fn parse_peer_override_splits_and_trims() {
+        assert_eq!(
+            parse_peer_override("/ip4/1.2.3.4/tcp/8302 , /dns4/hub/tcp/10003"),
+            Some(vec![
+                "/ip4/1.2.3.4/tcp/8302".to_string(),
+                "/dns4/hub/tcp/10003".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_peer_override_drops_blank_entries() {
+        assert_eq!(
+            parse_peer_override("/ip4/1.2.3.4/tcp/8302,,  ,"),
+            Some(vec!["/ip4/1.2.3.4/tcp/8302".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_peer_override_all_blank_is_none() {
+        assert_eq!(parse_peer_override(""), None);
+        assert_eq!(parse_peer_override("  , , "), None);
     }
 }
